@@ -20,6 +20,8 @@ import torch
 
 import legacy
 
+from training.transformers import SimilarityTransformer, PerspectiveTransformer
+
 #----------------------------------------------------------------------------
 
 def parse_range(s: Union[str, List]) -> List[int]:
@@ -93,8 +95,7 @@ def generate_images(
 
     \b
     # Generate an image using pre-trained AFHQv2 model ("Ours" in Figure 1, left).
-    python gen_images.py --outdir=out --trunc=1 --seeds=2 \\
-        --network=https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/stylegan3-r-afhqv2-512x512.pkl
+    python gen_images.py --outdir=out --trunc=1 --seeds=2  --network=https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/stylegan3-r-afhqv2-512x512.pkl
 
     \b
     # Generate uncurated images with truncation using the MetFaces-U dataset
@@ -119,6 +120,8 @@ def generate_images(
         if class_idx is not None:
             print ('warn: --class=lbl ignored when running on an unconditional network')
 
+    stn = PerspectiveTransformer(512).to(device)
+
     # Generate images.
     for seed_idx, seed in enumerate(seeds):
         print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
@@ -133,6 +136,9 @@ def generate_images(
             G.synthesis.input.transform.copy_(torch.from_numpy(m))
 
         img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
+
+        img = stn(img)
+
         img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
 
