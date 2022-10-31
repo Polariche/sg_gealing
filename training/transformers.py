@@ -4,22 +4,28 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torchvision.transforms import Resize
+from torchvision.transforms.functional import gaussian_blur
 import math 
+
 from training.networks_nostyle import ConvLayer, ResBlock
 from training.networks_stylegan2 import FullyConnectedLayer
 from training.antialiased_sampling import MipmapWarp, Warp
+from training.volumetric_rendering.renderer import ImportanceRenderer
 
-
+# TODO: move the constants somewhere else
 default_camera_dist = 2.1
+
 K = torch.tensor([[2.1326, 0, 0, 0],
                  [0, 2.1326, 0, 0],
                  [0, 0, 1, 0],
                  [0, 0, 0, 1]])
+
 default_cam = torch.tensor([[1, 0, 0, 0],
                             [0, 1, 0, 0],
                             [0, 0, 1, -default_camera_dist]])
 
+# from warping_heads.SimilarityHead
 def create_affine_mat2D(rot, scale, shift_x, shift_y):
     # This function takes the raw output of the parameter regression network and converts them into
     # an affine matrix representing the predicted similarity transformation.
@@ -93,6 +99,26 @@ def convert_square_mat(matrix):
 
     return square_mat
 
+def upgrade_2Dmat_to_3Dmat(matrix):
+    R = matrix[..., :2, :2]         # from roll
+    T = matrix[..., :2, -1:]        # from trans_x, and trans_y
+    
+    scale = torch.linalg.norm(R[..., 0, :].view(-1, 2), dim=-1).view(*matrix.shape[:-2])
+    scale = 1 / scale * global_default_dist
+    
+    zero = torch.zeros_like(scale)
+    one = torch.ones_like(scale)
+    
+    T = scale[..., None, None]*T
+    R = F.normalize(R, dim=-1)
+
+    M_2x4 = torch.cat([R,  torch.zeros_like(T), T], dim=-1)   
+    M_1x4 = torch.stack([zero, zero, one, scale], dim=-1).view(*matrix.shape[:-2], 1, 4)        
+    M_3x4 = torch.cat([M_2x4, M_1x4], dim=-2)
+    
+    return M_3x4
+
+
 
 class OSGDecoder(torch.nn.Module):
     def __init__(self, n_features, options):
@@ -121,18 +147,49 @@ class OSGDecoder(torch.nn.Module):
 
 
 class TriplaneBlock(nn.Module):
-    def __init__(self):
+    def __init__(self, input_size):
         super().__init__()
 
-        self.decoder = OSGDecoder(32, {'decoder_lr_mul': rendering_kwargs.get('decoder_lr_mul', 1), 'decoder_output_dim': 32})
+        self.input_size = input_size
+        self.plane_features = 32
+        self.color_features = 32
+        self.resizer = Resize(512)
+        self.encoder = nn.Sequential(
+                            ConvLayer(3, 256, input_size, kernel_size=1),
+                            ResBlock(256, 256, input_size, 3, up=1),
+                            ResBlock(256, 512, input_size //2, 3, up=0.5),
+                            ResBlock(512, 512, input_size //2, 3, up=1),
+                            ConvLayer(512, 3 * self.plane_features, input_size //2, kernel_size=1),
+                        )
+        self.decoder = OSGDecoder(self.plane_features, {'decoder_lr_mul': 0.001, 'decoder_output_dim': self.color_features})
+
+        self.renderer = ImportanceRenderer()
+
+        # TODO: feed options to the block via init argument, move constants somewhere else
+        self.rendering_options = {
+            'depth_resolution': 24,
+            'depth_resolution_importance': 24,
+            'ray_start': 2.25 - 0.6,
+            'ray_end': 3.3 - 0.6,
+            'disparity_space_sampling': False,
+            'box_warp': 1,
+            'clamp_mode': 'softplus',
+            'white_back': False,
+            #'resolution': 32,
+        }
     
     def encode_features(self, input_img):
-        pass
+        input_img = self.resizer(input_img)
+        features = self.encoder(input_img)
 
-    def render(self, planes, mat, resolution):
+        return features
+
+    def render(self, planes, resolution, mat):
+        # mat: world -> cam
+
         N = planes.shape[0]
         H = W = resolution
-        
+
         planes = planes.view(N, 3, -1, planes.shape[-2], planes.shape[-1])
 
         device = planes.device
@@ -140,21 +197,53 @@ class TriplaneBlock(nn.Module):
         depth = None
 
         # ------- ray sampling --------
-        # TODO
+
+        # invK_2d_grid = screen -> cam
         K_mat = K.to(device)
         invK_mat = torch.linalg.inv(K_mat)
-        invK_2d_grid = F.affine_grid(invK_mat[:3,:3].unsqueeze(0).repeat(N,1,1), (N, 2, H, W))     # (N, H, W, 2)
-        grid = torch.cat([invK_2d_grid, torch.ones_like(invK_2d_grid)], dim=-1)             # (N, H, W, 4)
+        invK_2d_grid = F.affine_grid(invK_mat[:2,:3].unsqueeze(0).repeat(N,1,1), (N, 2, H, W))     # (N, H, W, 2)
 
-        inv_mat = torch.linalg.inv(convert_square_mat(mat))
-        ray_dirs = (inv_mat[:, None, None] @ grid.unsqueeze(-1)).squeeze(-1)
-        ray_origins = (inv_mat @ invK_mat)[:, None, None, :3, -1].repeat(1, H, W, 1)
+        """
+        we multiply 0.5 due to L61 on volumetric_rendering: coordinates = (2/box_warp) * coordinates
+        original EG3D code starts from (-0.5, 0.5) range for [H,W] box, 
+        while we use (-1, 1) which is standard for F.affine_grid + F.grid_sample
+
+        range history for EG3D: 0.5 (initial) -> 1 (due to L61)
+        range history for our code: 1 (initial) -> 0.5 (by following code) -> 1 (due to L61)
+        """
+
+        grid = torch.cat([0.5*invK_2d_grid, torch.ones_like(invK_2d_grid)], dim=-1)                # (N, H, W, 4)
+
+        # inv_mat: cam -> world
+        inv_mat = torch.linalg.inv(convert_square_mat(mat))[..., :3, :4]
+
+        ray_dirs = (inv_mat[:, None, None] @ grid.unsqueeze(-1)).squeeze(-1).view(N, -1, 3)
+        ray_origins = (inv_mat @ invK_mat)[:, None, None, :3, -1].repeat(1, H, W, 1).view(N, -1, 3)
 
         # ------- rendering -----------
 
-        _, depth, _ = self.renderer(planes, self.decoder, ray_origins, ray_dirs, self.rendering_options)
+        colors, depth, weights = self.renderer(planes, self.decoder, ray_origins, ray_dirs, self.rendering_options)
 
-        return depth
+        colors = colors.view(N, H, W, self.color_features)
+        depth = depth.view(N, H, W, 1)
+
+        return colors, depth, weights
+
+    def forward(self, input_img, resolution=None, mat=None):
+        device = input_img.device
+
+        if resolution == None:
+            resolution = input_img.shape[2]
+
+        if mat == None:
+            N = input_img.shape[0]
+            inv_mat = default_cam.unsqueeze(0).repeat(N,1,1).to(device)
+            mat = torch.linalg.inv(convert_square_mat(inv_mat))
+
+        planes = self.encode_features(input_img)
+        colors, depth, weights = self.render(planes, resolution, mat)
+
+        return colors, depth, weights
 
 
 class Transformer(nn.Module):
@@ -240,18 +329,18 @@ class Transformer(nn.Module):
 
 
 class PerspectiveTransformer(Transformer):
-    def __init__(self, input_size, channel_multiplier=0.5, num_heads=1, antialias=True, intialize_zero=True):
+    def __init__(self, input_size, channel_multiplier=0.5, num_heads=1, antialias=True, initialize_zero=True):
         super().__init__(input_size, channel_multiplier, num_heads, antialias)
 
         self.final_linear = FullyConnectedLayer(self.channels[4] * 4 * 4, self.channels[4], activation='lrelu')
-
         self.really_final_linear = FullyConnectedLayer(self.channels[4], 2 * self.num_heads)
 
         if False: #initialize_zero:
             self.really_final_linear.weight.data.zero_()
             self.really_final_linear.bias.data.zero_()
 
-        self.triplane_block = TriplaneBlock()
+        # encoder - decoder 
+        self.triplane_block = TriplaneBlock(512)
     
     def encode_features(self, input_img):
         out = self.convs(input_img)
@@ -270,7 +359,35 @@ class PerspectiveTransformer(Transformer):
         for i in range(iters):
             out, prev_mat, _depth = self.single_forward(out, source_img, padding_mode, alpha, return_full=True, prev_mat=prev_mat, depth=depth, **kwargs)
             
+            # TODO: batchfiy use_initial_depth
             if (use_initial_depth and i == 1) or not use_initial_depth:
+                """
+                [EG3D]'s triplane generator sometimes receives a GT pose prior, sometimes not
+                if the prior is 100% reliable, the generator cheats by aligning the plane shape with the camera direction 
+                (see Fig4 on EG3D supplemental mat)
+
+                we have two choices for inferring the aligned volume 
+                    1. inferring from the initial 2D-aligned img
+                    2. iteratively refining the depth
+
+                each method has a potential downfall:
+                1: since the triplane is created from an image-to-image encoder, rather than a latent vector,
+                the inferred depth has a tendency to resemble the input image
+
+                2: if the initial depth is degenerate, the resulting image will also be degenerate
+                since each iteration is performed via a single network, the network receives two groups of input:
+                2D-cropped inputs from the first iteration, which are relatively "real"
+                and 3D-transformed inputs from further iterations, which may or may not be degenerate
+                the network will also be corrupted by degenerate inputs
+
+                1. has the least corrupted input, while 2. requires less transforming work from the network (assuming our iteration hasn't diverged)
+                by mixing two approaches in the same way EG3D makes its pose prior half-reliable on purpose,
+                we seek to estimate a better initial depth, while also utilizing the stabilizing property of iteration-based methods
+
+                on unrelated note, [IDE-3D] also uses a hybrid GAN inversion: initialization + iteration.
+                """
+
+                # update depth if the conditions are met
                 depth = _depth
 
         if return_full:
@@ -285,36 +402,91 @@ class PerspectiveTransformer(Transformer):
         N, C, H, W = source_img.shape 
         device = input_img.device
 
+        # -------------- prepare camera matrix ---------------------------------------------
+
         features = self.encode_features(input_img)
         params = self.really_final_linear(features)
 
-        # TODO
         mat = create_affine_mat3D(*([torch.zeros_like(params[:, :1])]*4), *torch.split(params, 1, dim=1)) 
 
         if prev_mat != None:
             if prev_mat.shape[-2] == 2:
-                # TODO
-                prev_mat = upgrade_2x3_to_3x4(prev_mat)                     
+                prev_mat = upgrade_2Dmat_to_3Dmat(prev_mat)                     
         else:
-            prev_mat = torch.linalg.inv(convert_square_mat(default_cam.unsqueeze(0).repeat(N,1,1))).to(device)[..., :3, :4]
+            # default_cam: cam1 -> world
+            default_cam_ = default_cam.unsqueeze(0).repeat(N,1,1).to(device)
+            default_cam_ = convert_square_mat(default_cam_)
+
+            # inv_default_cam: world -> cam1
+            prev_mat = torch.linalg.inv(default_cam_)[..., :3, :4]
 
         mat = prev_mat @ convert_square_mat(mat)        # (N, 3, 4)
+
+        # canonical camera for rendering the canonical depth
+        default_cam_ = convert_square_mat(default_cam[None]).to(device)
         
-        # TODO
+        # --------------- prepare canonical depth ------------------------------------------
+
+        # if we're not given an input depth, render the depth from scratch
+        if depth == None:
+            _, depth, _ = self.triplane_block(input_img, 128)
+
+            """
+            in ablation study of [StyleNeRF], without progressive learning, concave depths are created
+            [EG3D] Progressive Training blurs the image fed into the discriminator in early epochs, 
+            to reproduce the effect of progressive learning without having to modify the number of layers in midst of training
+
+            in early epochs, depth has noises which forces the output to be in lower res, and confuse the perceptual loss
+            by filtering out the noises with a blur kernel (e.g. gaussian), we can focus on the coarse geometry
+            """
+
+            # sigma from https://pytorch.org/vision/main/generated/torchvision.transforms.functional.gaussian_blur.html
+            # TODO: design sigma progression graph
+            # TODO: maybe use a better low-pass filter?? lancoz something from stylegan3....
+            kernel_size = 3
+            sigma = 0.3 * ((kernel_size - 1) * 0.5 - 1) + 2
+
+            # blur & upsampling
+            depth = depth.permute(0,3,1,2)
+            depth = gaussian_blur(depth, kernel_size, sigma)
+
+
+            """
+            RELATED WORK:
+                due to memory constraints, volume rendering is limited for low-res
+                prev works [StyleNeRF, StyleSDF, EG3D, ...] make up for low-res by post-aggregation 2D upsampling
+                the critical downside is that 3D priors are lost after aggregation, thus losing multi-view consistency
+                this is compenstated by NeRF path regularization [StyleNeRF], dual-discrimination [EG3D], or double discriminators [StyleSDF]
+                all of which serve to enforce consistency loss between the actual NeRF render and the upsampled render
+            
+            IDEA: 
+                instead of comparing full renders, maybe focus on high-frequency patches??
+                1 pixel in low-res = 2/4/8 pixel patch in high res
+                selectively render a potentionally high-res patch, 
+                do a switchy-swap with convex-upsampled (RAFT?) patch, or enforce consistency...
+            """
+
+            depth = F.interpolate(depth, (H, W), mode='bilinear')
+            depth = depth.permute(0,2,3,1)
+
+
+        # --------------- prepare sampling grid ---------------------------------------------
+
+        # apply K inverse: screen -> cam1, by affine_grid
         K_mat = K.to(device)                                                    
         invK_mat = torch.linalg.inv(K_mat)
-        invK_2d_grid = F.affine_grid(invK_mat[:2,:3].unsqueeze(0).repeat(N,1,1), (N, C, H, W), align_corners=False)#.to(device)     # (N, H, W, 2)
-
-        if depth == None:
-            # TODO: utilize triplaneblock
-            #depth = torch.ones_like(input_img.permute(0,2,3,1)[..., :1]) * default_camera_dist
-            depth = default_camera_dist + invK_2d_grid.pow(2).sum(dim=-1,keepdim=True)
+        invK_2d_grid = F.affine_grid(invK_mat[:2,:3].unsqueeze(0).repeat(N,1,1), (N, C, H, W), align_corners=False)     # (N, H, W, 2)
 
         grid = torch.cat([invK_2d_grid * depth, 
                         depth, 
                         torch.ones_like(invK_2d_grid[..., :1])], dim=-1)  # (N, H, W, 4)
 
-        default_cam_ = convert_square_mat(default_cam[None]).to(device)
+        # ---------------- transform the grid: cam1 -> world -> cam2 -> screen --------------
+        """
+        default_cam_ : cam1 -> world
+        mat: world -> cam2
+        K_mat : cam2 -> screen
+        """
 
         grid = ((K_mat[None, :3, :3] @ mat @ default_cam_)[:, None, None] @ grid.unsqueeze(-1)).squeeze(-1)
 
@@ -322,6 +494,10 @@ class PerspectiveTransformer(Transformer):
         grid = grid[..., :2] / (warped_depth + 1e-6)
 
         out = self.warper(source_img, grid, padding_mode=padding_mode)
+
+        # for visualization only
+        normalized_depth = (depth - depth.min()) / (depth.max() - depth.min()) 
+        depth = torch.cat([normalized_depth]*3, dim=-1).permute(0, 3, 1, 2)
 
         if return_full:
             return out, mat, depth
@@ -332,7 +508,7 @@ class PerspectiveTransformer(Transformer):
 
 
 class SimilarityTransformer(Transformer):
-    def __init__(self, input_size, channel_multiplier=0.5, num_heads=1, antialias=True, intialize_zero=True):
+    def __init__(self, input_size, channel_multiplier=0.5, num_heads=1, antialias=True, initialize_zero=True):
         super().__init__(input_size, channel_multiplier, num_heads, antialias)
 
         self.final_linear = FullyConnectedLayer(self.channels[4] * 4 * 4, self.channels[4], activation='lrelu')
@@ -359,8 +535,8 @@ class SimilarityTransformer(Transformer):
         params = self.really_final_linear(features)
         
         depth = torch.ones_like(input_img[..., :1]) * default_camera_dist
-        mat = create_affine_mat2D(*torch.split(params, 1, dim=1)) # TODO
-        print(mat)
+        mat = create_affine_mat2D(*torch.split(params, 1, dim=1))
+
         if prev_mat != None:
             mat = prev_mat @ convert_2x3_3x3(mat)
 

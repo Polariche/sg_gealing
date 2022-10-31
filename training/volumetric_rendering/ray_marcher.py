@@ -28,30 +28,30 @@ class MipRayMarcher2(nn.Module):
         densities_mid = (densities[:, :, :-1] + densities[:, :, 1:]) / 2
         depths_mid = (depths[:, :, :-1] + depths[:, :, 1:]) / 2
 
-
         if rendering_options['clamp_mode'] == 'softplus':
             densities_mid = F.softplus(densities_mid - 1) # activation bias of -1 makes things initialize better
         else:
             assert False, "MipRayMarcher only supports `clamp_mode`=`softplus`!"
 
         density_delta = densities_mid * deltas
-
         alpha = 1 - torch.exp(-density_delta)
-
         alpha_shifted = torch.cat([torch.ones_like(alpha[:, :, :1]), 1-alpha + 1e-10], -2)
         weights = alpha * torch.cumprod(alpha_shifted, -2)[:, :, :-1]
 
+        weight_total = weights.sum(-2, keepdim=True)
         composite_rgb = torch.sum(weights * colors_mid, -2)
         weight_total = weights.sum(2)
-        composite_depth = torch.sum(weights * depths_mid, -2) / weight_total
+        composite_depth = (torch.sum(weights * depths_mid, -2) + 1e-8) / (weight_total + 1e-10)
 
+        #weights = torch.cat([weights, torch.ones_like(weights[:, :, :1]) * (1-weight_total)], -2)
+        #depths_mid = torch.cat([depths_mid, depths_mid[:, :, -1].unsqueeze(-2)], -2)
+        
         # clip the composite to min/max range of depths
         composite_depth = torch.nan_to_num(composite_depth, float('inf'))
         composite_depth = torch.clamp(composite_depth, torch.min(depths), torch.max(depths))
 
-        if rendering_options.get('white_back', False):
-            composite_rgb = composite_rgb + 1 - weight_total
-
+        #if rendering_options.get('white_back', False):
+        #    composite_rgb = composite_rgb + 1 - weight_total
         composite_rgb = composite_rgb * 2 - 1 # Scale to (-1, 1)
 
         return composite_rgb, composite_depth, weights

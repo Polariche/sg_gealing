@@ -135,14 +135,33 @@ def generate_images(
             m = np.linalg.inv(m)
             G.synthesis.input.transform.copy_(torch.from_numpy(m))
 
+        # generate the original image
         img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
 
-        img = stn(img)
-
+        # transform
+        img, _, depth = stn(img, return_full=True)
         img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
 
+        depth = (depth.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        PIL.Image.fromarray(depth[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_depth.png')
 
+
+        # style-mixed image (layer=5, per gangealing)
+        z0 = torch.from_numpy(np.random.RandomState(4).randn(1, G.z_dim)).to(device)
+
+        w1 = G.mapping(z, label)
+        w0 = G.mapping(z0, label)
+
+        ws = torch.cat([w0[:, :5],  w1[:, 5:]], dim=1)
+
+        img2 = G.synthesis(ws)
+        img2 = (img2.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        PIL.Image.fromarray(img2[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_fixed.png')
+
+
+        # Calculate final W.
+        
 #----------------------------------------------------------------------------
 
 if __name__ == "__main__":
