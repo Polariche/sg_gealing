@@ -20,6 +20,35 @@ class Loss:
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg): # to be overridden by subclass
         raise NotImplementedError()
 
+class TransformerLoss(Loss):
+    def __init__(self, device, G, T, L, augment_pipe=None, use_initial_depth_prob=0, blur_init_sigma=0, blur_fade_kimg=0):
+        super().__init__()
+
+        self.device = device
+        self.G = G          # Generator
+        self.T = T          # Transformer
+        self.L = L          # Latent Learner
+
+        self.use_initial_depth_prob = use_initial_depth_prob 
+        self.blur_init_sigma    = blur_init_sigma
+        self.blur_fade_kimg     = blur_fade_kimg
+        pass
+    
+    def run_G(self, z, c):
+        pass
+
+    def run_T(self, img, blur_sigma=0, update_emas=False):
+        if self.augment_pipe is not None:
+            img = self.augment_pipe(img)
+
+        transformed_img = self.T(img, blur_sigma=blur_sigma, update_emas=update_emas)
+        pass
+
+    def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg): # to be overridden by subclass
+        blur_sigma = max(1 - 10000 / (self.blur_fade_kimg * 1e3), 0) * self.blur_init_sigma if self.blur_fade_kimg > 0 else 0
+        pass
+        
+        #raise NotImplementedError()
 #----------------------------------------------------------------------------
 
 class StyleGAN2Loss(Loss):

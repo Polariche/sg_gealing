@@ -5,13 +5,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.transforms import Resize
-from torchvision.transforms.functional import gaussian_blur
+from torchvision.transforms.functional import gaussian_blur, center_crop
 import math 
+import numpy as np
+
+from typing import List, Optional, Dict
 
 from training.networks_nostyle import ConvLayer, ResBlock
 from training.networks_stylegan2 import FullyConnectedLayer
 from training.antialiased_sampling import MipmapWarp, Warp
 from training.volumetric_rendering.renderer import ImportanceRenderer
+from torch_utils.ops import upfirdn2d
 
 # TODO: move the constants somewhere else
 default_camera_dist = 2.1
@@ -104,7 +108,7 @@ def upgrade_2Dmat_to_3Dmat(matrix):
     T = matrix[..., :2, -1:]        # from trans_x, and trans_y
     
     scale = torch.linalg.norm(R[..., 0, :].view(-1, 2), dim=-1).view(*matrix.shape[:-2])
-    scale = 1 / scale * global_default_dist
+    scale = 1 / scale * default_camera_dist 
     
     zero = torch.zeros_like(scale)
     one = torch.ones_like(scale)
@@ -198,7 +202,7 @@ class TriplaneBlock(nn.Module):
 
         # ------- ray sampling --------
 
-        # invK_2d_grid = screen -> cam
+        # invK_2d_grid : screen -> cam
         K_mat = K.to(device)
         invK_mat = torch.linalg.inv(K_mat)
         invK_2d_grid = F.affine_grid(invK_mat[:2,:3].unsqueeze(0).repeat(N,1,1), (N, 2, H, W))     # (N, H, W, 2)
@@ -295,13 +299,11 @@ class Transformer(nn.Module):
     def encode_features(self, input_img):
         return self.convs(input_img)
 
-    def forward(self, input_img, source_img=None, padding_mode='border', alpha=None, iters=1, return_full=False, prev_mat=None, **kwargs):
+    def forward(self, input_img, source_img=None, padding_mode='border', alpha=None, iters=1, return_full=False, prev_mat=None, depth=None, **kwargs):
         if source_img == None:
             source_img = input_img
 
         out = input_img
-        prev_mat = None
-        depth = None
 
         for i in range(iters):
             out, prev_mat, depth = self.single_forward(out, source_img, padding_mode, alpha, return_full=True, prev_mat=prev_mat, depth=depth, **kwargs)
@@ -339,6 +341,10 @@ class PerspectiveTransformer(Transformer):
             self.really_final_linear.weight.data.zero_()
             self.really_final_linear.bias.data.zero_()
 
+        if True: #initialize_zero:
+            self.really_final_linear.weight.data.mul_(0.5)
+            self.really_final_linear.bias.data.mul_(0.5)
+
         # encoder - decoder 
         self.triplane_block = TriplaneBlock(512)
     
@@ -348,19 +354,17 @@ class PerspectiveTransformer(Transformer):
 
         return out
 
-    def forward(self, input_img, source_img=None, padding_mode='border', alpha=None, iters=1, return_full=False, prev_mat=None, use_initial_depth=False, **kwargs):
+    def forward(self, input_img, source_img=None, padding_mode='border', alpha=None, iters=1, return_full=False, prev_mat=None, depth=None, use_initial_depth=False, **kwargs):
         if source_img == None:
             source_img = input_img
 
         out = input_img
-        prev_mat = None
-        depth = None
 
         for i in range(iters):
             out, prev_mat, _depth = self.single_forward(out, source_img, padding_mode, alpha, return_full=True, prev_mat=prev_mat, depth=depth, **kwargs)
             
             # TODO: batchfiy use_initial_depth
-            if (use_initial_depth and i == 1) or not use_initial_depth:
+            if not use_initial_depth:
                 """
                 [EG3D]'s triplane generator sometimes receives a GT pose prior, sometimes not
                 if the prior is 100% reliable, the generator cheats by aligning the plane shape with the camera direction 
@@ -395,7 +399,7 @@ class PerspectiveTransformer(Transformer):
         else:
             return out
 
-    def single_forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, depth=None, **kwargs):
+    def single_forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, depth=None, blur_sigma=0, **kwargs):
         if source_img == None: 
             source_img = input_img
 
@@ -429,7 +433,7 @@ class PerspectiveTransformer(Transformer):
 
         # if we're not given an input depth, render the depth from scratch
         if depth == None:
-            _, depth, _ = self.triplane_block(input_img, 128)
+            _, depth, _ = self.triplane_block(input_img, 256)
 
             """
             in ablation study of [StyleNeRF], without progressive learning, concave depths are created
@@ -442,14 +446,23 @@ class PerspectiveTransformer(Transformer):
 
             # sigma from https://pytorch.org/vision/main/generated/torchvision.transforms.functional.gaussian_blur.html
             # TODO: design sigma progression graph
-            # TODO: maybe use a better low-pass filter?? lancoz something from stylegan3....
-            kernel_size = 3
-            sigma = 0.3 * ((kernel_size - 1) * 0.5 - 1) + 2
-
-            # blur & upsampling
             depth = depth.permute(0,3,1,2)
-            depth = gaussian_blur(depth, kernel_size, sigma)
 
+            blur_size = np.floor(blur_sigma * 3)
+            if blur_size > 0:
+                with torch.autograd.profiler.record_function('blur'):
+                    """
+                    without reflection padding, spatial inductive bias is introduced to depth image around the border 
+                    (see Positional Encoding as Spatial Inductive Bias in GANs for the effect of zero-padding)
+                    """
+                    original_size = depth.shape[2:]
+                    blur_size_int = int(blur_size)
+                    depth = F.pad(depth, (blur_size_int,blur_size_int,blur_size_int,blur_size_int), "reflect")
+
+                    f = torch.arange(-blur_size, blur_size + 1, device=depth.device).div(blur_sigma).square().neg().exp2()
+                    depth = upfirdn2d.filter2d(depth, f / f.sum())
+
+                    depth = center_crop(depth, original_size)
 
             """
             RELATED WORK:
@@ -495,10 +508,6 @@ class PerspectiveTransformer(Transformer):
 
         out = self.warper(source_img, grid, padding_mode=padding_mode)
 
-        # for visualization only
-        normalized_depth = (depth - depth.min()) / (depth.max() - depth.min()) 
-        depth = torch.cat([normalized_depth]*3, dim=-1).permute(0, 3, 1, 2)
-
         if return_full:
             return out, mat, depth
         
@@ -517,6 +526,10 @@ class SimilarityTransformer(Transformer):
         if False: #initialize_zero:
             self.really_final_linear.weight.data.zero_()
             self.really_final_linear.bias.data.zero_()
+        
+        if True: #initialize_zero:
+            self.really_final_linear.weight.data.mul_(0.2)
+            self.really_final_linear.bias.data.mul_(0.2)
     
     def encode_features(self, input_img):
         out = self.convs(input_img)
@@ -534,17 +547,38 @@ class SimilarityTransformer(Transformer):
         features = self.encode_features(input_img)
         params = self.really_final_linear(features)
         
-        depth = torch.ones_like(input_img[..., :1]) * default_camera_dist
+        #depth = torch.ones_like(input_img.permute(0,2,3,1)[..., :1]) * default_camera_dist
         mat = create_affine_mat2D(*torch.split(params, 1, dim=1))
 
         if prev_mat != None:
-            mat = prev_mat @ convert_2x3_3x3(mat)
+            mat = prev_mat @ convert_square_mat(mat)
 
         grid = F.affine_grid(mat, (N, C, H, W), align_corners=False).to(device)
         out = self.warper(source_img, grid, padding_mode=padding_mode)
 
         if return_full:
-            return out, mat, depth
+            return out, mat, None #depth
         
+        else:
+            return out
+
+
+class TransformerSequence(nn.Module):
+    def __init__(self, transformers: List[Transformer]):
+        super().__init__()
+        self.transformers = transformers
+    
+    def forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, depth=None, use_initial_depth=False, **kwargs):
+        if source_img == None:
+            source_img = input_img
+
+        out = input_img
+        kwargs['return_full'] = True
+
+        for transformer in self.transformers:
+            out, prev_mat, depth = transformer(out, prev_mat=prev_mat, depth=depth, **kwargs)
+
+        if return_full:
+            return out, prev_mat, depth
         else:
             return out

@@ -20,7 +20,7 @@ import torch
 
 import legacy
 
-from training.transformers import SimilarityTransformer, PerspectiveTransformer
+from training.transformers import SimilarityTransformer, PerspectiveTransformer, TransformerSequence
 
 #----------------------------------------------------------------------------
 
@@ -120,7 +120,10 @@ def generate_images(
         if class_idx is not None:
             print ('warn: --class=lbl ignored when running on an unconditional network')
 
-    stn = PerspectiveTransformer(512).to(device)
+    stn1 = SimilarityTransformer(256).to(device)
+    stn2 = PerspectiveTransformer(256).to(device)
+
+    stn = TransformerSequence([stn1, stn2])
 
     # Generate images.
     for seed_idx, seed in enumerate(seeds):
@@ -139,21 +142,28 @@ def generate_images(
         img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
 
         # transform
-        img, _, depth = stn(img, return_full=True)
+        blur_sigma = max(1 - 10000 / (1000 * 1e3), 0) * 7.5
+        img, _, depth = stn(img, blur_sigma = blur_sigma, return_full=True, iters=2)
+        
+
         img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
+
+        # normalize & RGB
+        normalized_depth = (depth - depth.min()) / (depth.max() - depth.min()) 
+        depth = torch.cat([normalized_depth]*3, dim=-1).permute(0, 3, 1, 2)
 
         depth = (depth.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         PIL.Image.fromarray(depth[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_depth.png')
 
-
+        
         # style-mixed image (layer=5, per gangealing)
-        z0 = torch.from_numpy(np.random.RandomState(4).randn(1, G.z_dim)).to(device)
+        z0 = torch.from_numpy(np.random.RandomState(2).randn(1, G.z_dim)).to(device)
 
         w1 = G.mapping(z, label)
         w0 = G.mapping(z0, label)
 
-        ws = torch.cat([w0[:, :5],  w1[:, 5:]], dim=1)
+        ws = torch.cat([w0[:, :0],  w1[:, 0:]], dim=1)
 
         img2 = G.synthesis(ws)
         img2 = (img2.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
