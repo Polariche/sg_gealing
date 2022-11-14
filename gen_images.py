@@ -21,6 +21,7 @@ import torch
 import legacy
 
 from training.transformers import SimilarityTransformer, PerspectiveTransformer, TransformerSequence
+from training.latent_learner import DirectionInterpolator
 
 #----------------------------------------------------------------------------
 
@@ -123,7 +124,9 @@ def generate_images(
     stn1 = SimilarityTransformer(256).to(device)
     stn2 = PerspectiveTransformer(256).to(device)
 
-    stn = TransformerSequence([stn1, stn2])
+    stn = TransformerSequence([stn1, stn2]).to(device)
+
+    ll = DirectionInterpolator(pca_path=None, n_comps=1, inject_index=5, n_latent=14, num_heads=1).to(device)
 
     # Generate images.
     for seed_idx, seed in enumerate(seeds):
@@ -141,9 +144,12 @@ def generate_images(
         # generate the original image
         img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
 
+        img0 = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        PIL.Image.fromarray(img0[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_original.png')
+
         # transform
-        blur_sigma = max(1 - 10000 / (1000 * 1e3), 0) * 7.5
-        img, _, depth = stn(img, blur_sigma = blur_sigma, return_full=True, iters=2)
+        blur_sigma = max(1 - 10000 / (1000 * 1e3), 0) * 2
+        img, _, depth = stn(img, blur_sigma = blur_sigma, return_full=True, iters=1)
         
 
         img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
@@ -156,16 +162,10 @@ def generate_images(
         depth = (depth.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         PIL.Image.fromarray(depth[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_depth.png')
 
-        
-        # style-mixed image (layer=5, per gangealing)
-        z0 = torch.from_numpy(np.random.RandomState(2).randn(1, G.z_dim)).to(device)
-
         w1 = G.mapping(z, label)
-        w0 = G.mapping(z0, label)
+        ws =  ll([w1[:, 0, :]], psi=0)
 
-        ws = torch.cat([w0[:, :0],  w1[:, 0:]], dim=1)
-
-        img2 = G.synthesis(ws)
+        img2 = G.synthesis(ws[0])
         img2 = (img2.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         PIL.Image.fromarray(img2[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_fixed.png')
 

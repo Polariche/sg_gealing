@@ -14,14 +14,22 @@ from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import upfirdn2d
 
+import math
+
+from training.lpips import get_perceptual_loss
+from training.transformers import convert_square_mat, create_mat3D_from_gen_z
+
+
 #----------------------------------------------------------------------------
 
 class Loss:
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg): # to be overridden by subclass
         raise NotImplementedError()
 
+#----------------------------------------------------------------------------
+
 class TransformerLoss(Loss):
-    def __init__(self, device, G, T, L, augment_pipe=None, use_initial_depth_prob=0, blur_init_sigma=0, blur_fade_kimg=0):
+    def __init__(self, device, G, T, L, augment_pipe=None, use_initial_depth_prob=0, blur_init_sigma=0, blur_fade_kimg=0, psi_anneal=2000):
         super().__init__()
 
         self.device = device
@@ -32,23 +40,73 @@ class TransformerLoss(Loss):
         self.use_initial_depth_prob = use_initial_depth_prob 
         self.blur_init_sigma    = blur_init_sigma
         self.blur_fade_kimg     = blur_fade_kimg
-        pass
-    
-    def run_G(self, z, c):
-        pass
+        self.psi_anneal         = psi_anneal
+        self.augment_pipe       = augment_pipe
 
-    def run_T(self, img, blur_sigma=0, update_emas=False):
+        self.lpips_loss_fn = get_perceptual_loss('lpips', self.device)
+
+
+    def run_G(self, z, c, align=False, psi=None, update_emas=False):
+        G = self.G
+        ws = G.mapping(z, c, update_emas=update_emas)
+        img = G.synthesis(ws, update_emas=update_emas)
+
+        if not align:
+            return img, ws
+
+        else:
+            ws_aligned = self.L([ws[:, 0, :]], psi=psi)[0]
+            img_aligned = G.synthesis(ws_aligned, update_emas=update_emas)
+            
+            return img, ws, img_aligned, ws_aligned
+
+    def run_T(self, img, blur_sigma=0, return_full=False, update_emas=False):
         if self.augment_pipe is not None:
             img = self.augment_pipe(img)
 
-        transformed_img = self.T(img, blur_sigma=blur_sigma, update_emas=update_emas)
-        pass
+        ret = self.T(img, blur_sigma=blur_sigma, return_full=return_full, update_emas=update_emas)
+
+        if return_full:
+            transformed_img, mat, depth = ret
+            return transformed_img, mat, depth
+
+        else:
+            transformed_img = ret
+
+            return transformed_img
+
 
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg): # to be overridden by subclass
-        blur_sigma = max(1 - 10000 / (self.blur_fade_kimg * 1e3), 0) * self.blur_init_sigma if self.blur_fade_kimg > 0 else 0
-        pass
+        # set up constants
+        blur_sigma = max(1 - cur_nimg / (self.blur_fade_kimg * 1e3), 0) * self.blur_init_sigma if self.blur_fade_kimg > 0 else 0
         
-        #raise NotImplementedError()
+        # cosine anneal, from gangealing.utils.annealing.cosine_anneal
+        psi = 0.5 * (1 + torch.cos(torch.tensor(math.pi * min(cur_nimg//1000, self.psi_anneal) / self.psi_anneal)))
+        psi = psi.to(self.device)
+
+        training_stats.report('Loss/psi', psi)
+
+        # run G & T
+        with torch.autograd.profiler.record_function('Gmain_forward'):
+            #with torch.no_grad():
+            img, ws, img_aligned, ws_aligned = self.run_G(gen_z, gen_c, align=True, psi=psi)
+            transformed_img = self.run_T(img.clone().detach(), return_full=False, blur_sigma=blur_sigma)
+
+            #mat_label = create_mat3D_from_gen_z(gen_z * 1e-1)
+            #mat_loss = (torch.linalg.inv(convert_square_mat(mat_label)) @ convert_square_mat(mat) - torch.eye(4)[None].to(self.device)).pow(2)
+
+            #mat_loss = (mat_label[:, :3, :3] - mat[:, :3, :3]).pow(2).mean() + (mat_label[:, :3, -1] - mat[:, :3, -1]).pow(2).mean()
+
+            #training_stats.report('Loss/mat_loss', mat_loss)
+
+            perceptual_loss = self.lpips_loss_fn(img_aligned.clone().detach(), transformed_img)
+            training_stats.report('Loss/perceptual_loss', perceptual_loss)
+
+        with torch.autograd.profiler.record_function('Gmain_backward'):
+            #mat_loss.mean().mul(1).backward()
+            #pass 
+            perceptual_loss.mean().mul(gain).backward()
+
 #----------------------------------------------------------------------------
 
 class StyleGAN2Loss(Loss):

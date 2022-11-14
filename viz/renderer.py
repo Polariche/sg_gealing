@@ -250,6 +250,12 @@ class Renderer:
         res.has_noise = any('noise_const' in name for name, _buf in G.synthesis.named_buffers())
         res.has_input_transform = (hasattr(G.synthesis, 'input') and hasattr(G.synthesis.input, 'transform'))
 
+        try:
+            T = self.get_network(pkl, 'T_ema')
+            has_T = True
+        except:
+            has_T = False
+
         # Set input transform.
         if res.has_input_transform:
             m = np.eye(3)
@@ -285,23 +291,42 @@ class Renderer:
             w[:, stylemix_idx] = all_ws[stylemix_seed][np.newaxis, stylemix_idx]
         w += w_avg
 
+        class Sequential(torch.nn.Module):
+            def __init__(self, modules):
+                super().__init__()
+                self.ms = torch.nn.ModuleList(modules)
+
+                #self.ms[1][0].fixed_params = torch.tensor([[0.0, 0.0, 0, 0]]).to("cuda")
+                #self.ms[1][1].fixed_params = torch.tensor([[0.1, 0.1]]).to("cuda")
+
+            def forward(self, x, **kwargs):
+                out1 = self.ms[0](x, **kwargs)
+                out2 = self.ms[1](out1)
+
+                return out2
+
+        if has_T:
+            network = Sequential([G.synthesis, T])
+        else:
+            network = G.synthesis
+
         # Run synthesis network.
         synthesis_kwargs = dnnlib.EasyDict(noise_mode=noise_mode, force_fp32=force_fp32)
         torch.manual_seed(random_seed)
-        out, layers = self.run_synthesis_net(G.synthesis, w, capture_layer=layer_name, **synthesis_kwargs)
+        out, layers = self.run_synthesis_net(network, w, capture_layer=layer_name, **synthesis_kwargs)
 
         # Update layer list.
-        cache_key = (G.synthesis, tuple(sorted(synthesis_kwargs.items())))
+        cache_key = (network, tuple(sorted(synthesis_kwargs.items())))
         if cache_key not in self._net_layers:
             if layer_name is not None:
                 torch.manual_seed(random_seed)
-                _out, layers = self.run_synthesis_net(G.synthesis, w, **synthesis_kwargs)
+                _out, layers = self.run_synthesis_net(network, w, **synthesis_kwargs)
             self._net_layers[cache_key] = layers
         res.layers = self._net_layers[cache_key]
 
         # Untransform.
-        if untransform and res.has_input_transform:
-            out, _mask = _apply_affine_transformation(out.to(torch.float32), G.synthesis.input.transform, amax=6) # Override amax to hit the fast path in upfirdn2d.
+        #if untransform and res.has_input_transform:
+        #    out, _mask = _apply_affine_transformation(out.to(torch.float32), G.synthesis.input.transform, amax=6) # Override amax to hit the fast path in upfirdn2d.
 
         # Select channels and compute statistics.
         out = out[0].to(torch.float32)
@@ -344,10 +369,14 @@ class Renderer:
 
         def module_hook(module, _inputs, outputs):
             outputs = list(outputs) if isinstance(outputs, (tuple, list)) else [outputs]
-            outputs = [out for out in outputs if isinstance(out, torch.Tensor) and out.ndim in [4, 5]]
+            outputs = [out for out in outputs if isinstance(out, torch.Tensor) and out.ndim in [3, 4, 5]]
             for idx, out in enumerate(outputs):
                 if out.ndim == 5: # G-CNN => remove group dimension.
                     out = out.mean(2)
+                if out.ndim == 3:
+                    out = out.unsqueeze(1)
+                if out.ndim == 4 and out.shape[1] > out.shape[-1]:
+                    out = out.permute(0,3,1,2)
                 name = submodule_names[module]
                 if name == '':
                     name = 'output'

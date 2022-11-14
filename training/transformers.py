@@ -11,11 +11,13 @@ import numpy as np
 
 from typing import List, Optional, Dict
 
-from training.networks_nostyle import ConvLayer, ResBlock
+#from training.networks_nostyle import ConvLayer, ResBlock
 from training.networks_stylegan2 import FullyConnectedLayer
 from training.antialiased_sampling import MipmapWarp, Warp
 from training.volumetric_rendering.renderer import ImportanceRenderer
 from torch_utils.ops import upfirdn2d
+
+from training.rosinality.networks import ConvLayer, ResBlock, EqualLinear
 
 # TODO: move the constants somewhere else
 default_camera_dist = 2.1
@@ -113,7 +115,7 @@ def upgrade_2Dmat_to_3Dmat(matrix):
     zero = torch.zeros_like(scale)
     one = torch.ones_like(scale)
     
-    T = scale[..., None, None]*T
+    T = scale[..., None, None]*T / default_camera_dist
     R = F.normalize(R, dim=-1)
 
     M_2x4 = torch.cat([R,  torch.zeros_like(T), T], dim=-1)   
@@ -122,7 +124,13 @@ def upgrade_2Dmat_to_3Dmat(matrix):
     
     return M_3x4
 
+def create_mat3D_from_gen_z(gen_z):
+    params_label = gen_z[:, :6]
+    mat2d_label = create_affine_mat2D(*torch.split(params_label[:, :4], 1, dim=1))
+    mat3d_label = create_affine_mat3D(None,None,None,None, *torch.split(params_label[:, 4:], 1, dim=1))
+    mat_label = upgrade_2Dmat_to_3Dmat(mat2d_label) @ convert_square_mat(mat3d_label)
 
+    return mat_label
 
 class OSGDecoder(torch.nn.Module):
     def __init__(self, n_features, options):
@@ -157,14 +165,35 @@ class TriplaneBlock(nn.Module):
         self.input_size = input_size
         self.plane_features = 32
         self.color_features = 32
-        self.resizer = Resize(512)
+        self.resizer = Resize(input_size)
+        """
+        # nvidia
         self.encoder = nn.Sequential(
-                            ConvLayer(3, 256, input_size, kernel_size=1),
-                            ResBlock(256, 256, input_size, 3, up=1),
-                            ResBlock(256, 512, input_size //2, 3, up=0.5),
-                            ResBlock(512, 512, input_size //2, 3, up=1),
-                            ConvLayer(512, 3 * self.plane_features, input_size //2, kernel_size=1),
+                            ConvLayer(3, 128, input_size, kernel_size=1),
+                            #ResBlock(128, 128, input_size, 3, up=1),
+                            ResBlock(128, 256, input_size //2, 3, up=0.5),
+                            ResBlock(256, 256, input_size //2, 3, up=1),
+                            ConvLayer(256, 3 * self.plane_features, input_size //2, kernel_size=1),
                         )
+        """
+
+        """
+        IDEA: formulate encoder as...
+        (fixed GAN layers; ~5 layers) + (the rest of GAN layer)
+                                           ^ stylization by latent code from img encdoer
+
+        this way, we can inject a shape prior into the canonical volume space
+        """
+
+        # rosinality
+        self.encoder = nn.Sequential(
+                            ConvLayer(3, 128, 1),
+                            ResBlock(128, 128, downsample=False),
+                            ResBlock(128, 256, downsample=True),
+                            ResBlock(256, 256, downsample=False),
+                            ConvLayer(256, 3 * self.plane_features, 1),
+                        )
+
         self.decoder = OSGDecoder(self.plane_features, {'decoder_lr_mul': 0.001, 'decoder_output_dim': self.color_features})
 
         self.renderer = ImportanceRenderer()
@@ -194,7 +223,7 @@ class TriplaneBlock(nn.Module):
         N = planes.shape[0]
         H = W = resolution
 
-        planes = planes.view(N, 3, -1, planes.shape[-2], planes.shape[-1])
+        planes = planes.view(planes.shape[0], 3, -1, planes.shape[-2], planes.shape[-1])
 
         device = planes.device
 
@@ -205,7 +234,7 @@ class TriplaneBlock(nn.Module):
         # invK_2d_grid : screen -> cam
         K_mat = K.to(device)
         invK_mat = torch.linalg.inv(K_mat)
-        invK_2d_grid = F.affine_grid(invK_mat[:2,:3].unsqueeze(0).repeat(N,1,1), (N, 2, H, W))     # (N, H, W, 2)
+        invK_2d_grid = F.affine_grid(invK_mat[:2,:3].unsqueeze(0), (1, 2, H, W))     # (1, H, W, 2)
 
         """
         we multiply 0.5 due to L61 on volumetric_rendering: coordinates = (2/box_warp) * coordinates
@@ -216,13 +245,13 @@ class TriplaneBlock(nn.Module):
         range history for our code: 1 (initial) -> 0.5 (by following code) -> 1 (due to L61)
         """
 
-        grid = torch.cat([0.5*invK_2d_grid, torch.ones_like(invK_2d_grid)], dim=-1)                # (N, H, W, 4)
+        grid = torch.cat([0.5*invK_2d_grid, torch.ones_like(invK_2d_grid)], dim=-1).expand(N, -1, -1, -1)                # (N, H, W, 4)
 
         # inv_mat: cam -> world
-        inv_mat = torch.linalg.inv(convert_square_mat(mat))[..., :3, :4]
+        inv_mat = torch.linalg.inv(convert_square_mat(mat))[..., :3, :4].expand(N, -1, -1)
 
         ray_dirs = (inv_mat[:, None, None] @ grid.unsqueeze(-1)).squeeze(-1).view(N, -1, 3)
-        ray_origins = (inv_mat @ invK_mat)[:, None, None, :3, -1].repeat(1, H, W, 1).view(N, -1, 3)
+        ray_origins = (inv_mat @ invK_mat.unsqueeze(0))[:, None, None, :3, -1].expand(-1, H, W, -1).view(N, -1, 3)
 
         # ------- rendering -----------
 
@@ -239,7 +268,7 @@ class TriplaneBlock(nn.Module):
         if resolution == None:
             resolution = input_img.shape[2]
 
-        if mat == None:
+        if True: #mat == None:
             N = input_img.shape[0]
             inv_mat = default_cam.unsqueeze(0).repeat(N,1,1).to(device)
             mat = torch.linalg.inv(convert_square_mat(inv_mat))
@@ -251,25 +280,27 @@ class TriplaneBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, input_size, channel_multiplier=0.5, num_heads=1, antialias=True):
+    def __init__(self, input_size, channel_multiplier=0.5, num_heads=1, antialias=True, fixed_params=None):
         super().__init__()
 
         self.channels = {
-            4: 512,
-            8: 512,
-            16: 512,
-            32: 512,
-            64: 256 * channel_multiplier,
+            4: 256,
+            8: 256,
+            16: 256,
+            32: 128,
+            64: 128 * channel_multiplier,
             128: 128 * channel_multiplier,
             256: 64 * channel_multiplier,
             512: 32 * channel_multiplier,
             1024: 16 * channel_multiplier,
         }
 
-        convs = [ConvLayer(3, int(self.channels[input_size]), input_size, kernel_size=1)]
+        blur_kernel=[1, 3, 3, 1]
+
+        #convs = [ConvLayer(3, int(self.channels[input_size]), input_size, kernel_size=1)]  # nvidia
+        convs = [ConvLayer(3, int(self.channels[input_size]), 1)] # rosinality
 
         log_size = int(math.log(input_size, 2))
-        log_downsample = int(math.log(8, 2))
 
         in_channel = self.channels[input_size]
 
@@ -284,20 +315,29 @@ class Transformer(nn.Module):
             up = 1 if not downsample else 0.5
             out_channel = self.channels[img_size]
 
-            convs.append(ResBlock(int(in_channel), int(out_channel), img_size, 3, up=up))
+            #convs.append(ResBlock(int(in_channel), int(out_channel), img_size, 3, up=up))      # nvidia
+            convs.append(ResBlock(int(in_channel), int(out_channel), blur_kernel, downsample)) # rosinality
 
             in_channel = out_channel
 
         # final_conv
-        convs = convs + [ConvLayer(in_channel, self.channels[4], img_size, 3)]
+        #convs = convs + [ConvLayer(in_channel, self.channels[4], img_size, 3)]
+        convs = convs + [ConvLayer(in_channel, self.channels[4], 3)]     # rosinality
 
         self.convs = nn.Sequential(*convs)
         self.num_heads = num_heads
         self.warper = MipmapWarp(max_num_levels = 3.5) if antialias else Warp()
 
+        self.fixed_params = fixed_params
 
     def encode_features(self, input_img):
         return self.convs(input_img)
+
+    def infer_params(self, input_img):
+        if self.fixed_params != None:
+            return self.fixed_params
+        else:
+            raise NotImplementedError()
 
     def forward(self, input_img, source_img=None, padding_mode='border', alpha=None, iters=1, return_full=False, prev_mat=None, depth=None, **kwargs):
         if source_img == None:
@@ -331,28 +371,43 @@ class Transformer(nn.Module):
 
 
 class PerspectiveTransformer(Transformer):
-    def __init__(self, input_size, channel_multiplier=0.5, num_heads=1, antialias=True, initialize_zero=True):
-        super().__init__(input_size, channel_multiplier, num_heads, antialias)
+    def __init__(self, input_size, channel_multiplier=0.5, num_heads=1, antialias=True, fixed_params=None, initialize_zero=True):
+        super().__init__(input_size, channel_multiplier, num_heads, antialias, fixed_params)
 
-        self.final_linear = FullyConnectedLayer(self.channels[4] * 4 * 4, self.channels[4], activation='lrelu')
-        self.really_final_linear = FullyConnectedLayer(self.channels[4], 2 * self.num_heads)
+        #self.final_linear = FullyConnectedLayer(self.channels[4] * 4 * 4, self.channels[4], activation='lrelu')    # nvidia
+        self.final_linear = EqualLinear(self.channels[4] * 4 * 4, self.channels[4], activation='fused_lrelu')     # rosinality
+        self.really_final_linear = nn.Linear(self.channels[4], 2 * self.num_heads)
 
-        if False: #initialize_zero:
+        if initialize_zero:
             self.really_final_linear.weight.data.zero_()
             self.really_final_linear.bias.data.zero_()
 
-        if True: #initialize_zero:
-            self.really_final_linear.weight.data.mul_(0.5)
-            self.really_final_linear.bias.data.mul_(0.5)
+        #if True: #initialize_zero:
+        #    self.really_final_linear.weight.data.mul_(0.5)
+        #    #self.really_final_linear.bias.data.mul_(0.5)
+        #    self.really_final_linear.bias.data.zero_()
 
         # encoder - decoder 
-        self.triplane_block = TriplaneBlock(512)
+        self.triplane_block = TriplaneBlock(256)
     
     def encode_features(self, input_img):
         out = self.convs(input_img)
         out = self.final_linear(out.view(out.shape[0], -1))
 
         return out
+    
+    def infer_params(self, input_img):
+        if self.fixed_params != None:
+            assert self.fixed_params.shape[-1] == self.really_final_linear.weight.data.shape[0]
+
+            return self.fixed_params
+        else:
+            features = self.encode_features(input_img)
+            params = self.really_final_linear(features)
+
+            #print(params.std(0), params.mean(0), self.really_final_linear.bias.data)
+
+            return params
 
     def forward(self, input_img, source_img=None, padding_mode='border', alpha=None, iters=1, return_full=False, prev_mat=None, depth=None, use_initial_depth=False, **kwargs):
         if source_img == None:
@@ -364,7 +419,7 @@ class PerspectiveTransformer(Transformer):
             out, prev_mat, _depth = self.single_forward(out, source_img, padding_mode, alpha, return_full=True, prev_mat=prev_mat, depth=depth, **kwargs)
             
             # TODO: batchfiy use_initial_depth
-            if not use_initial_depth:
+            if not use_initial_depth or (i == 0 and use_initial_depth):
                 """
                 [EG3D]'s triplane generator sometimes receives a GT pose prior, sometimes not
                 if the prior is 100% reliable, the generator cheats by aligning the plane shape with the camera direction 
@@ -399,26 +454,55 @@ class PerspectiveTransformer(Transformer):
         else:
             return out
 
-    def single_forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, depth=None, blur_sigma=0, **kwargs):
+    def single_forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, depth=None, blur_sigma=0,  **kwargs):
         if source_img == None: 
             source_img = input_img
 
-        N, C, H, W = source_img.shape 
         device = input_img.device
 
         # -------------- prepare camera matrix ---------------------------------------------
-
-        features = self.encode_features(input_img)
-        params = self.really_final_linear(features)
+        params = self.infer_params(input_img)
 
         mat = create_affine_mat3D(*([torch.zeros_like(params[:, :1])]*4), *torch.split(params, 1, dim=1)) 
+        mat = self.join_prev_mat(mat, prev_mat)
 
+        # canonical camera for rendering the canonical depth
+        default_cam_ = convert_square_mat(default_cam[None]).to(device)
+        render_mat = torch.linalg.inv(default_cam_)[..., :3, :4]
+
+        out, depth = self.render_and_warp(input_img, mat, render_mat, source_img=source_img, depth=depth, padding_mode=padding_mode, blur_sigma=blur_sigma)
+
+        if return_full:
+            return out, mat, depth
+        
+        else:
+            return out
+
+    def siamese_forward(self, out_t, out_s, source_img, prev_mat_t=None, prev_mat_s=None, padding_mode='border', **kwargs):
+        params_s = self.infer_params(out_s)
+
+        mat_s = create_affine_mat3D(*([torch.zeros_like(params_s[:, :1])]*4), *torch.split(params_s, 1, dim=1))
+        mat_s = self.join_prev_mat(mat_s, prev_mat_s)
+
+
+        params_t = self.infer_params(out_t)
+
+        mat_t = create_affine_mat3D(*([torch.zeros_like(params_t[:, :1])]*4), *torch.split(params_t, 1, dim=1))
+        mat_t = self.join_prev_mat(mat_t, prev_mat_t)
+
+
+        out, _ = self.render_and_warp(out_t, mat_s, mat_t,  source_img=source_img, **kwargs)
+
+        return out
+
+
+    def join_prev_mat(self, mat, prev_mat=None):
         if prev_mat != None:
             if prev_mat.shape[-2] == 2:
                 prev_mat = upgrade_2Dmat_to_3Dmat(prev_mat)                     
         else:
             # default_cam: cam1 -> world
-            default_cam_ = default_cam.unsqueeze(0).repeat(N,1,1).to(device)
+            default_cam_ = default_cam.unsqueeze(0).repeat(N,1,1).to(mat.device)
             default_cam_ = convert_square_mat(default_cam_)
 
             # inv_default_cam: world -> cam1
@@ -426,17 +510,29 @@ class PerspectiveTransformer(Transformer):
 
         mat = prev_mat @ convert_square_mat(mat)        # (N, 3, 4)
 
-        # canonical camera for rendering the canonical depth
-        default_cam_ = convert_square_mat(default_cam[None]).to(device)
-        
+        return mat
+
+    def render_and_warp(self, input_img, mat, render_mat, source_img=None, depth=None, padding_mode='border', blur_sigma=0):
+        if source_img == None: 
+            source_img = input_img
+
+        N, C, H, W = source_img.shape 
+        device = input_img.device
+
         # --------------- prepare canonical depth ------------------------------------------
+
+        """
+        We assume truncated img with psi to be the canon; 
+        since psi changes as the training proceeds, the output transform is relative to the current psi-img, rather than being absolute
+        Rather than relying on such assumption, we could adapt siamese architecture, and use the inferred param of the target img to render the depth
+        """
 
         # if we're not given an input depth, render the depth from scratch
         if depth == None:
-            _, depth, _ = self.triplane_block(input_img, 256)
+            _, depth, _ = self.triplane_block(input_img, 64, mat=render_mat)
 
             """
-            in ablation study of [StyleNeRF], without progressive learning, concave depths are created
+            in an ablation study of [StyleNeRF], without progressive learning, concave depths are created
             [EG3D] Progressive Training blurs the image fed into the discriminator in early epochs, 
             to reproduce the effect of progressive learning without having to modify the number of layers in midst of training
 
@@ -485,57 +581,80 @@ class PerspectiveTransformer(Transformer):
 
         # --------------- prepare sampling grid ---------------------------------------------
 
-        # apply K inverse: screen -> cam1, by affine_grid
+        """
+        apply K inverse: screen -> cam1, by affine_grid
+        """
+
         K_mat = K.to(device)                                                    
         invK_mat = torch.linalg.inv(K_mat)
         invK_2d_grid = F.affine_grid(invK_mat[:2,:3].unsqueeze(0).repeat(N,1,1), (N, C, H, W), align_corners=False)     # (N, H, W, 2)
 
+        ones = torch.ones_like(invK_2d_grid[..., :1])
         grid = torch.cat([invK_2d_grid * depth, 
                         depth, 
-                        torch.ones_like(invK_2d_grid[..., :1])], dim=-1)  # (N, H, W, 4)
+                        ones], dim=-1)  # (N, H, W, 4)
 
         # ---------------- transform the grid: cam1 -> world -> cam2 -> screen --------------
         """
-        default_cam_ : cam1 -> world
+        inv(render_mat) : cam1 -> world
         mat: world -> cam2
         K_mat : cam2 -> screen
         """
 
-        grid = ((K_mat[None, :3, :3] @ mat @ default_cam_)[:, None, None] @ grid.unsqueeze(-1)).squeeze(-1)
+        #print(mat.std(0))
+        inv_render_mat = torch.linalg.inv(convert_square_mat(render_mat))
+        grid = ((K_mat[None, :3, :3] @ mat @ inv_render_mat)[:, None, None] @ grid.unsqueeze(-1)).squeeze(-1)
 
         warped_depth = grid[..., 2:3]
         grid = grid[..., :2] / (warped_depth + 1e-6)
 
         out = self.warper(source_img, grid, padding_mode=padding_mode)
 
-        if return_full:
-            return out, mat, depth
-        
-        else:
-            return out
+        return out, depth
+
+    
 
 
 
 class SimilarityTransformer(Transformer):
-    def __init__(self, input_size, channel_multiplier=0.5, num_heads=1, antialias=True, initialize_zero=True):
-        super().__init__(input_size, channel_multiplier, num_heads, antialias)
+    def __init__(self, input_size, channel_multiplier=0.5, num_heads=1, antialias=True, fixed_params=None, initialize_zero=True):
+        super().__init__(input_size, channel_multiplier, num_heads, antialias, fixed_params)
 
-        self.final_linear = FullyConnectedLayer(self.channels[4] * 4 * 4, self.channels[4], activation='lrelu')
-        self.really_final_linear = FullyConnectedLayer(self.channels[4], 4 * self.num_heads)
+        #self.final_linear = FullyConnectedLayer(self.channels[4] * 4 * 4, self.channels[4], activation='lrelu')    # nvidia
+        self.final_linear = EqualLinear(self.channels[4] * 4 * 4, self.channels[4], activation='fused_lrelu')     # rosinality
+        self.really_final_linear = nn.Linear(self.channels[4], 4 * self.num_heads)
 
-        if False: #initialize_zero:
+        if initialize_zero:
             self.really_final_linear.weight.data.zero_()
             self.really_final_linear.bias.data.zero_()
-        
-        if True: #initialize_zero:
-            self.really_final_linear.weight.data.mul_(0.2)
-            self.really_final_linear.bias.data.mul_(0.2)
+
+        #if True: #initialize_zero:
+        #    self.really_final_linear.weight.data.mul_(0.5)
+        #    #self.really_final_linear.bias.data.mul_(0.5)
+        #    self.really_final_linear.bias.data.zero_()
     
     def encode_features(self, input_img):
         out = self.convs(input_img)
         out = self.final_linear(out.view(out.shape[0], -1))
 
         return out
+
+    def infer_params(self, input_img):
+        if self.fixed_params != None:
+            assert self.fixed_params.shape[-1] == self.really_final_linear.weight.data.shape[0]
+
+            return self.fixed_params
+        else:
+            features = self.encode_features(input_img)
+            params = self.really_final_linear(features)
+
+            return params
+
+    def join_prev_mat(self, mat, prev_mat=None):
+        if prev_mat != None:
+            mat = prev_mat @ convert_square_mat(mat)
+        
+        return mat
 
     def single_forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, **kwargs):
         if source_img == None: 
@@ -544,29 +663,47 @@ class SimilarityTransformer(Transformer):
         N, C, H, W = source_img.shape 
         device = input_img.device
 
-        features = self.encode_features(input_img)
-        params = self.really_final_linear(features)
+        params = self.infer_params(input_img)
         
-        #depth = torch.ones_like(input_img.permute(0,2,3,1)[..., :1]) * default_camera_dist
         mat = create_affine_mat2D(*torch.split(params, 1, dim=1))
-
-        if prev_mat != None:
-            mat = prev_mat @ convert_square_mat(mat)
-
+        mat = self.join_prev_mat(mat, prev_mat)
+        
         grid = F.affine_grid(mat, (N, C, H, W), align_corners=False).to(device)
         out = self.warper(source_img, grid, padding_mode=padding_mode)
 
         if return_full:
-            return out, mat, None #depth
+            return out, mat, None
         
         else:
             return out
+    
+
+    def siamese_forward(self, out_t, out_s, source_img, prev_mat_t=None, prev_mat_s=None, padding_mode='border', **kwargs):
+        N, C, H, W = source_img.shape
+        device = out_t.device
+
+        params_s = self.infer_params(out_s)
+        
+        mat_s = create_affine_mat2D(*torch.split(params_s, 1, dim=1))
+        mat_s = self.join_prev_mat(mat_s, prev_mat_s)
+
+        params_t = self.infer_params(out_t)
+
+        mat_t = create_affine_mat2D(*torch.split(params_t, 1, dim=1))
+        mat_t = self.join_prev_mat(mat_t, prev_mat_t)
+
+        inv_mat_t = torch.linalg.inv(convert_square_mat(mat_t))
+
+        grid = F.affine_grid(mat_s @ inv_mat_t, (N, C, H, W), align_corners=False).to(device)
+        out = self.warper(source_img, grid, padding_mode=padding_mode)
+
+        return out
 
 
 class TransformerSequence(nn.Module):
     def __init__(self, transformers: List[Transformer]):
         super().__init__()
-        self.transformers = transformers
+        self.transformers = nn.ModuleList(transformers)
     
     def forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, depth=None, use_initial_depth=False, **kwargs):
         if source_img == None:
@@ -576,9 +713,38 @@ class TransformerSequence(nn.Module):
         kwargs['return_full'] = True
 
         for transformer in self.transformers:
-            out, prev_mat, depth = transformer(out, prev_mat=prev_mat, depth=depth, **kwargs)
+            out, prev_mat, depth = transformer(out, source_img=source_img, prev_mat=prev_mat, depth=depth, **kwargs)
 
         if return_full:
             return out, prev_mat, depth
         else:
             return out
+
+    
+    def siamese_forward(self, target_img, source_img, padding_mode='border', alpha=None, return_full=False, 
+                        use_initial_depth=False, **kwargs):
+        
+        kwargs['return_full'] = True
+        prev_mat_s = depth_s = None
+        prev_mat_s = depth_t = None
+
+        out_s = source_img
+        out_t = target_img
+        """
+        align to the canonical until the last transformer module
+        in the last module, render with target img's matrix, and warp to the source img
+        """
+
+        for transformer in self.transformers[:-1]:
+            out_s, prev_mat_s, depth_s = transformer(out_s, source_img=source_img, prev_mat=prev_mat_s, depth=depth_s, **kwargs)
+            out_t, prev_mat_t, depth_t = transformer(out_t, source_img=target_img, prev_mat=prev_mat_t, depth=depth_t, **kwargs)
+
+        last_transformer = self.transformers[-1]
+        
+        #last_transformer.siamese_forward(out_s, out_t, target_img, prev_mat_s, prev_mat_t)
+
+        return last_transformer.siamese_forward(out_t, out_s, source_img, prev_mat_t, prev_mat_s)
+
+
+    def __getitem__(self, i):
+        return self.transformers[i]

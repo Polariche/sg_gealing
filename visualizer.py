@@ -314,7 +314,11 @@ def main(
             'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan2/versions/1/files/stylegan2-ffhqu-256x256.pkl',
             'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan2/versions/1/files/stylegan2-lsundog-256x256.pkl',
             'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan2/versions/1/files/stylegan2-metfaces-1024x1024.pkl',
-            'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan2/versions/1/files/stylegan2-metfacesu-1024x1024.pkl'
+            'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan2/versions/1/files/stylegan2-metfacesu-1024x1024.pkl',
+            'https://nvlabs-fi-cdn.nvidia.com/stylegan2/networks/stylegan2-cat-config-f.pkl',
+            '/home/sooa/Projects/sg_gealing/~/training-runs/00186-stylegan2-lsun_cat-gpus1-batch8/network-snapshot-000000.pkl',
+            '/home/sooa/Projects/sg_gealing/~/training-runs/00077-stylegan2-lsun_cat-gpus1-batch8/network-snapshot-000196.pkl',
+            '/home/sooa/Gits/gangealing/pretrained/cat.pt',
         ]
 
         # Populate recent pickles list with pretrained model URLs.
