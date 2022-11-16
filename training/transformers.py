@@ -11,13 +11,13 @@ import numpy as np
 
 from typing import List, Optional, Dict
 
-#from training.networks_nostyle import ConvLayer, ResBlock
-from training.networks_stylegan2 import FullyConnectedLayer
+from training.networks_stylegan2 import FullyConnectedLayer, Conv2dLayer
+from training.networks_stylegan2 import DiscriminatorBlock as ResBlock, DiscriminatorEpilogue as ResEpilogue
 from training.antialiased_sampling import MipmapWarp, Warp
 from training.volumetric_rendering.renderer import ImportanceRenderer
 from torch_utils.ops import upfirdn2d
 
-from training.rosinality.networks import ConvLayer, ResBlock, EqualLinear
+#from training.rosinality.networks import ConvLayer, ResBlock, EqualLinear
 
 # TODO: move the constants somewhere else
 default_camera_dist = 2.1
@@ -167,24 +167,7 @@ class TriplaneBlock(nn.Module):
         self.color_features = 32
         self.resizer = Resize(input_size)
         """
-        # nvidia
-        self.encoder = nn.Sequential(
-                            ConvLayer(3, 128, input_size, kernel_size=1),
-                            #ResBlock(128, 128, input_size, 3, up=1),
-                            ResBlock(128, 256, input_size //2, 3, up=0.5),
-                            ResBlock(256, 256, input_size //2, 3, up=1),
-                            ConvLayer(256, 3 * self.plane_features, input_size //2, kernel_size=1),
-                        )
-        """
-
-        """
-        IDEA: formulate encoder as...
-        (fixed GAN layers; ~5 layers) + (the rest of GAN layer)
-                                           ^ stylization by latent code from img encdoer
-
-        this way, we can inject a shape prior into the canonical volume space
-        """
-
+        
         # rosinality
         self.encoder = nn.Sequential(
                             ConvLayer(3, 128, 1),
@@ -193,6 +176,25 @@ class TriplaneBlock(nn.Module):
                             ResBlock(256, 256, downsample=False),
                             ConvLayer(256, 3 * self.plane_features, 1),
                         )
+        """
+        # nvidia
+        self.convs = nn.ModuleList([
+                            Conv2dLayer(3, 128, kernel_size=1),
+                            #ResBlock(128, 128, input_size, 3, up=1),
+                            ResBlock(128, 128, 256, input_size, 3, 1),
+                            #ResBlock(256, 256, input_size //2, 3, up=1),
+                            Conv2dLayer(256, 3 * self.plane_features, kernel_size=1),
+                            
+                        ])
+        """
+        IDEA: formulate encoder as...
+        (fixed GAN layers; ~5 layers) + (the rest of GAN layer)
+                                           ^ stylization by latent code from img encdoer
+
+        this way, we can inject a shape prior into the canonical volume space
+        """
+
+        
 
         self.decoder = OSGDecoder(self.plane_features, {'decoder_lr_mul': 0.001, 'decoder_output_dim': self.color_features})
 
@@ -213,9 +215,15 @@ class TriplaneBlock(nn.Module):
     
     def encode_features(self, input_img):
         input_img = self.resizer(input_img)
-        features = self.encoder(input_img)
+        img = input_img
 
-        return features
+        out = self.convs[0](input_img)
+        for c in self.convs[1:-1]:
+            out, img = c(out, img)
+        out = self.convs[-1](out)
+
+
+        return out
 
     def render(self, planes, resolution, mat):
         # mat: world -> cam
@@ -280,7 +288,7 @@ class TriplaneBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, input_size, channel_multiplier=0.5, num_heads=1, antialias=True, fixed_params=None):
+    def __init__(self, input_size, out_features, channel_multiplier=0.5, num_heads=1, antialias=True, fixed_params=None):
         super().__init__()
 
         self.channels = {
@@ -294,11 +302,12 @@ class Transformer(nn.Module):
             512: 32 * channel_multiplier,
             1024: 16 * channel_multiplier,
         }
+        self.out_features = out_features
 
         blur_kernel=[1, 3, 3, 1]
 
-        #convs = [ConvLayer(3, int(self.channels[input_size]), input_size, kernel_size=1)]  # nvidia
-        convs = [ConvLayer(3, int(self.channels[input_size]), 1)] # rosinality
+        convs = [Conv2dLayer(3, int(self.channels[input_size]), kernel_size=1)]  # nvidia
+        #convs = [ConvLayer(3, int(self.channels[input_size]), 1)] # rosinality
 
         log_size = int(math.log(input_size, 2))
 
@@ -308,36 +317,53 @@ class Transformer(nn.Module):
         assert end_log >= 0
 
         num_downsamples = 0
+        layer_idx=1
         for i in range(log_size, end_log, -1):
             downsample = True #(not self.is_flow) or (num_downsamples < log_downsample)
             num_downsamples += downsample
-            img_size = 2 ** (i-1)
+            img_size = 2 ** i
             up = 1 if not downsample else 0.5
             out_channel = self.channels[img_size]
 
+            convs.append(ResBlock(int(in_channel), int(in_channel), int(out_channel), img_size, 3, layer_idx))      # nvidia
             #convs.append(ResBlock(int(in_channel), int(out_channel), img_size, 3, up=up))      # nvidia
-            convs.append(ResBlock(int(in_channel), int(out_channel), blur_kernel, downsample)) # rosinality
+            #convs.append(ResBlock(int(in_channel), int(out_channel), blur_kernel, downsample)) # rosinality
 
             in_channel = out_channel
+            layer_idx = layer_idx+1
 
+        img_size = img_size//2
         # final_conv
-        #convs = convs + [ConvLayer(in_channel, self.channels[4], img_size, 3)]
-        convs = convs + [ConvLayer(in_channel, self.channels[4], 3)]     # rosinality
+        #convs = convs + [Conv2dLayer(in_channel, self.channels[4], 3)]  # nvidia
+        #convs = convs + [ConvLayer(in_channel, self.channels[4], 3)]     # rosinality
 
-        self.convs = nn.Sequential(*convs)
+        self.convs = nn.ModuleList(convs)
+        self.epilogue = ResEpilogue(in_channel, out_features, img_size, 3, sum_cmap=False)
+
         self.num_heads = num_heads
-        self.warper = MipmapWarp(max_num_levels = 3.5) if antialias else Warp()
+        self.warper = Warp() #MipmapWarp(max_num_levels = 3.5) if antialias else Warp()
 
         self.fixed_params = fixed_params
 
     def encode_features(self, input_img):
-        return self.convs(input_img)
+        img = input_img
+        out = self.convs[0](input_img)
+        for c in self.convs[1:]:
+            out, img = c(out, img)
+
+        cmap = torch.ones((input_img.shape[0], self.out_features), device=input_img.device)
+        out = self.epilogue(out, img, cmap)
+
+        return out
 
     def infer_params(self, input_img):
         if self.fixed_params != None:
+            assert self.fixed_params.shape[-1] == self.out_features
+
             return self.fixed_params
         else:
-            raise NotImplementedError()
+            params = self.encode_features(input_img)
+            return params
 
     def forward(self, input_img, source_img=None, padding_mode='border', alpha=None, iters=1, return_full=False, prev_mat=None, depth=None, **kwargs):
         if source_img == None:
@@ -372,42 +398,9 @@ class Transformer(nn.Module):
 
 class PerspectiveTransformer(Transformer):
     def __init__(self, input_size, channel_multiplier=0.5, num_heads=1, antialias=True, fixed_params=None, initialize_zero=True):
-        super().__init__(input_size, channel_multiplier, num_heads, antialias, fixed_params)
-
-        #self.final_linear = FullyConnectedLayer(self.channels[4] * 4 * 4, self.channels[4], activation='lrelu')    # nvidia
-        self.final_linear = EqualLinear(self.channels[4] * 4 * 4, self.channels[4], activation='fused_lrelu')     # rosinality
-        self.really_final_linear = nn.Linear(self.channels[4], 2 * self.num_heads)
-
-        if initialize_zero:
-            self.really_final_linear.weight.data.zero_()
-            self.really_final_linear.bias.data.zero_()
-
-        #if True: #initialize_zero:
-        #    self.really_final_linear.weight.data.mul_(0.5)
-        #    #self.really_final_linear.bias.data.mul_(0.5)
-        #    self.really_final_linear.bias.data.zero_()
-
-        # encoder - decoder 
+        super().__init__(input_size, 2, channel_multiplier, num_heads, antialias, fixed_params)
+        
         self.triplane_block = TriplaneBlock(256)
-    
-    def encode_features(self, input_img):
-        out = self.convs(input_img)
-        out = self.final_linear(out.view(out.shape[0], -1))
-
-        return out
-    
-    def infer_params(self, input_img):
-        if self.fixed_params != None:
-            assert self.fixed_params.shape[-1] == self.really_final_linear.weight.data.shape[0]
-
-            return self.fixed_params
-        else:
-            features = self.encode_features(input_img)
-            params = self.really_final_linear(features)
-
-            #print(params.std(0), params.mean(0), self.really_final_linear.bias.data)
-
-            return params
 
     def forward(self, input_img, source_img=None, padding_mode='border', alpha=None, iters=1, return_full=False, prev_mat=None, depth=None, use_initial_depth=False, **kwargs):
         if source_img == None:
@@ -618,37 +611,7 @@ class PerspectiveTransformer(Transformer):
 
 class SimilarityTransformer(Transformer):
     def __init__(self, input_size, channel_multiplier=0.5, num_heads=1, antialias=True, fixed_params=None, initialize_zero=True):
-        super().__init__(input_size, channel_multiplier, num_heads, antialias, fixed_params)
-
-        #self.final_linear = FullyConnectedLayer(self.channels[4] * 4 * 4, self.channels[4], activation='lrelu')    # nvidia
-        self.final_linear = EqualLinear(self.channels[4] * 4 * 4, self.channels[4], activation='fused_lrelu')     # rosinality
-        self.really_final_linear = nn.Linear(self.channels[4], 4 * self.num_heads)
-
-        if initialize_zero:
-            self.really_final_linear.weight.data.zero_()
-            self.really_final_linear.bias.data.zero_()
-
-        #if True: #initialize_zero:
-        #    self.really_final_linear.weight.data.mul_(0.5)
-        #    #self.really_final_linear.bias.data.mul_(0.5)
-        #    self.really_final_linear.bias.data.zero_()
-    
-    def encode_features(self, input_img):
-        out = self.convs(input_img)
-        out = self.final_linear(out.view(out.shape[0], -1))
-
-        return out
-
-    def infer_params(self, input_img):
-        if self.fixed_params != None:
-            assert self.fixed_params.shape[-1] == self.really_final_linear.weight.data.shape[0]
-
-            return self.fixed_params
-        else:
-            features = self.encode_features(input_img)
-            params = self.really_final_linear(features)
-
-            return params
+        super().__init__(input_size, 4,  channel_multiplier, num_heads, antialias, fixed_params)
 
     def join_prev_mat(self, mat, prev_mat=None):
         if prev_mat != None:
@@ -670,6 +633,9 @@ class SimilarityTransformer(Transformer):
         
         grid = F.affine_grid(mat, (N, C, H, W), align_corners=False).to(device)
         out = self.warper(source_img, grid, padding_mode=padding_mode)
+
+        #out = grid.permute(0,3,1,2)
+        #out = torch.cat([out, out[:, :1]], dim=1)
 
         if return_full:
             return out, mat, None
@@ -701,9 +667,12 @@ class SimilarityTransformer(Transformer):
 
 
 class TransformerSequence(nn.Module):
-    def __init__(self, transformers: List[Transformer]):
+    def __init__(self, width=256):
         super().__init__()
-        self.transformers = nn.ModuleList(transformers)
+        self.transformers = nn.ModuleList([SimilarityTransformer(width),
+                                            PerspectiveTransformer(width)])
+
+        
     
     def forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, depth=None, use_initial_depth=False, **kwargs):
         if source_img == None:

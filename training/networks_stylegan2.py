@@ -681,6 +681,7 @@ class DiscriminatorEpilogue(torch.nn.Module):
         mbstd_num_channels  = 1,        # Number of features for the minibatch standard deviation layer, 0 = disable.
         activation          = 'lrelu',  # Activation function: 'relu', 'lrelu', etc.
         conv_clamp          = None,     # Clamp the output of convolution layers to +-X, None = disable clamping.
+        sum_cmap            = True,
     ):
         assert architecture in ['orig', 'skip', 'resnet']
         super().__init__()
@@ -689,6 +690,7 @@ class DiscriminatorEpilogue(torch.nn.Module):
         self.resolution = resolution
         self.img_channels = img_channels
         self.architecture = architecture
+        self.sum_cmap = sum_cmap
 
         if architecture == 'skip':
             self.fromrgb = Conv2dLayer(img_channels, in_channels, kernel_size=1, activation=activation)
@@ -720,7 +722,11 @@ class DiscriminatorEpilogue(torch.nn.Module):
         # Conditioning.
         if self.cmap_dim > 0:
             misc.assert_shape(cmap, [None, self.cmap_dim])
-            x = (x * cmap).sum(dim=1, keepdim=True) * (1 / np.sqrt(self.cmap_dim))
+            
+            if self.sum_cmap:
+                x = (x * cmap).sum(dim=1, keepdim=True) * (1 / np.sqrt(self.cmap_dim))
+            else:
+                x = (x * cmap) * (1 / np.sqrt(self.cmap_dim)) #.sum(dim=1, keepdim=True) 
 
         assert x.dtype == dtype
         return x

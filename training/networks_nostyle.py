@@ -55,7 +55,7 @@ class ConvLayer(torch.nn.Module):
         assert noise_mode in ['random', 'const', 'none']
         in_resolution = int(self.resolution / self.up)
         misc.assert_shape(x, [None, self.in_channels, in_resolution, in_resolution])
-        styles = (torch.ones(x.shape[0], x.shape[1]) / np.sqrt(self.in_channels * self.kernel_size * self.kernel_size)).to(x.device) #self.affine(w)
+        styles = torch.ones((x.shape[0], x.shape[1]), device=x.device) / np.sqrt(self.in_channels * self.kernel_size * self.kernel_size) #self.affine(w)
 
         noise = None
         if self.use_noise and noise_mode == 'random':
@@ -65,6 +65,7 @@ class ConvLayer(torch.nn.Module):
 
         flip_weight = (self.up == 1) # slightly faster
         kwargs = {'up': self.up} if self.up >= 1 else {'down': int(1 / self.up)}
+        
         x = modulated_conv2d(x=x, weight=self.weight, styles=styles, noise=noise, #up=self.up, 
             padding=self.padding, resample_filter=self.resample_filter, flip_weight=flip_weight, fused_modconv=fused_modconv,
             demodulate=False,

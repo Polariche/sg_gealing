@@ -24,7 +24,7 @@ from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import grid_sample_gradfix
 
 import legacy
-from metrics import metric_main
+from metrics import metric_main, metric_utils
 
 from training.transformers import SimilarityTransformer, PerspectiveTransformer, TransformerSequence, create_mat3D_from_gen_z
 from training.loss import TransformerLoss
@@ -118,7 +118,7 @@ def training_loop(
     ada_interval            = 4,        # How often to perform ADA adjustment?
     ada_kimg                = 500,      # ADA adjustment speed, measured in how many kimg it takes for p to increase/decrease by one unit.
     total_kimg              = 25000,    # Total length of the training, measured in thousands of real images.
-    kimg_per_tick           = 4,        # Progress snapshot interval.
+    kimg_per_tick           = 0.01,        # Progress snapshot interval.
     image_snapshot_ticks    = 50,       # How often to save image snapshots? None = disable.
     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
     resume_pkl              = None,     # Network pickle to resume training from.
@@ -360,6 +360,7 @@ def training_loop(
             save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
 
         # Save network snapshot.
+        
         snapshot_pkl = None
         snapshot_data = None
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
@@ -438,7 +439,7 @@ def training_loop_tl(
     data_loader_kwargs      = {},       # Options for torch.utils.data.DataLoader.
     G_kwargs                = {},       # Options for generator network.
     T_kwargs                = {},
-    TL_opt_kwargs           = {},
+    T_opt_kwargs            = {},
     #D_kwargs                = {},       # Options for discriminator network.
     #G_opt_kwargs            = {},       # Options for generator optimizer.
     #D_opt_kwargs            = {},       # Options for discriminator optimizer.
@@ -502,14 +503,19 @@ def training_loop_tl(
     G_ema = copy.deepcopy(G).eval()
 
     # TODO : dnnlib-ify ??
-    stn1 = SimilarityTransformer(256).to(device)
-    stn2 = PerspectiveTransformer(256).to(device)
+    #stn1 = SimilarityTransformer(256).requires_grad_(False).to(device)
+    #stn2 = PerspectiveTransformer(256).requires_grad_(False).to(device)
 
-    T = TransformerSequence([stn1, stn2], **T_kwargs).train().to(device)
+    T = TransformerSequence(**T_kwargs).train().requires_grad_(False).to(device)
+    #T = SimilarityTransformer(256, **T_kwargs).train().requires_grad_(False).to(device)
     T_ema = copy.deepcopy(T).eval()
 
     L = DirectionInterpolator(pca_path=None, n_comps=1, inject_index=5, n_latent=14, num_heads=1).to(device)
 
+
+    vgg16_url = './pretrained/vgg16.pkl' #'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/vgg16.pkl'
+    vgg16 = metric_utils.get_feature_detector(vgg16_url, num_gpus=num_gpus, rank=rank,  verbose=True).requires_grad_(False).to(device)
+    #vgg16 = None
 
     # Resume from existing pickle.
     if (resume_pkl is not None) and (rank == 0):
@@ -521,17 +527,17 @@ def training_loop_tl(
 
     
     n_pca = 1000# if args.debug else 1000000
-    with torch.no_grad():
+    #with torch.no_grad():
         # randomly sample z -> map to w
         #batch_w = G_ema.batch_latent(n_pca // get_world_size())
 
-        grid_z = torch.randn([n_pca, G_ema.z_dim], device=device).split(batch_gpu)
-        grid_c = torch.zeros((n_pca, 0), device=device).split(batch_gpu)
-        batch_w = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])[:, 0]
+    #    grid_z = torch.randn([n_pca, G_ema.z_dim], device=device).split(batch_gpu)
+    #    grid_c = torch.zeros((n_pca, 0), device=device).split(batch_gpu)
+    #    batch_w = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])[:, 0]
 
     #batch_w = all_gather(batch_w)
-    pca = PCA(1, batch_w)
-    L.assign_buffers(pca)
+    #pca = PCA(1, batch_w)
+    #L.assign_buffers(pca)
         
 
     # Print network summary tables.
@@ -556,22 +562,23 @@ def training_loop_tl(
     # Distribute across GPUs.
     if rank == 0:
         print(f'Distributing across {num_gpus} GPUs...')
-    for module in [G, G_ema, T, T_ema, L, augment_pipe]: #D
+    
+
+    for module in [G, G_ema, T, T_ema, L, augment_pipe, vgg16]: #D
         if module is not None and num_gpus > 1:
             for param in misc.params_and_buffers(module):
                 torch.distributed.broadcast(param, src=0)
+
 
     # Setup training phases.
     if rank == 0:
         print('Setting up training phases...')
     #loss = dnnlib.util.construct_class_by_name(device=device, G=G, D=D, augment_pipe=augment_pipe, **loss_kwargs) # subclass of training.loss.Loss
-    loss = dnnlib.util.construct_class_by_name(device=device, G=G, T=T, L=L, augment_pipe=augment_pipe, **loss_kwargs)
+    loss = dnnlib.util.construct_class_by_name(device=device, G=G, T=T, L=L, vgg=vgg16, augment_pipe=augment_pipe, **loss_kwargs)
 
-
-    TL = torch.nn.ModuleList([T, L])
 
     phases = []
-    for name, module, opt_kwargs, reg_interval in [('T', T, TL_opt_kwargs, None)]: #,[('G', G, G_opt_kwargs, G_reg_interval): ('D', D, D_opt_kwargs, D_reg_interval)]:
+    for name, module, opt_kwargs, reg_interval in [('T', T, T_opt_kwargs, None)]: #,[('G', G, G_opt_kwargs, G_reg_interval): ('D', D, D_opt_kwargs, D_reg_interval)]:
         if reg_interval is None:
             opt = dnnlib.util.construct_class_by_name(params=module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
             phases += [dnnlib.EasyDict(name=name+'both', module=module, opt=opt, interval=1)]
@@ -594,6 +601,7 @@ def training_loop_tl(
     grid_size = None
     grid_z = None
     grid_c = None
+
     if rank == 0:
         print('Exporting sample images...')
         #grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
@@ -617,6 +625,7 @@ def training_loop_tl(
 
             img_aligned = torch.cat([G_ema.synthesis(ws_aligned_[None]) for ws_aligned_ in ws_aligned])
             save_image_grid(img_aligned.cpu().numpy(), os.path.join(run_dir, 'fakes_aligned_init.png'), drange=[-1,1], grid_size=grid_size)
+
 
     # Initialize logs.
     if rank == 0:
@@ -665,13 +674,17 @@ def training_loop_tl(
                 continue
             if phase.start_event is not None:
                 phase.start_event.record(torch.cuda.current_stream(device))
-           
+            
+            
+            
             # Accumulate gradients.
             phase.opt.zero_grad(set_to_none=True)
             phase.module.requires_grad_(True)
+            
             for gen_z, gen_c in zip(phase_gen_z, phase_gen_c):
                 loss.accumulate_gradients(phase=phase.name, real_img=None, real_c=None, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
             phase.module.requires_grad_(False)
+            
             
             # Update weights.
             with torch.autograd.profiler.record_function(phase.name + '_opt'):
@@ -687,21 +700,23 @@ def training_loop_tl(
                         param.grad = grad.reshape(param.shape)
                 phase.opt.step()
             
+            
             # Phase done.
             if phase.end_event is not None:
                 phase.end_event.record(torch.cuda.current_stream(device))
         
-        # Update G_ema.
-        #with torch.autograd.profiler.record_function('Tema'):
-        #    ema_nimg = ema_kimg * 1000
-        #    if ema_rampup is not None:
-        #        ema_nimg = min(ema_nimg, cur_nimg * ema_rampup)
-        #    ema_beta = 0.5 ** (batch_size / max(ema_nimg, 1e-8))
-        #    for p_ema, p in zip(T_ema.parameters(), T.parameters()):
-        #        p_ema.copy_(p.lerp(p_ema, ema_beta))
-        #    for b_ema, b in zip(T_ema.buffers(), T.buffers()):
-        #        b_ema.copy_(b)
+        # Update T_ema.
+        with torch.autograd.profiler.record_function('Tema'):
+            ema_nimg = ema_kimg * 1000
+            if ema_rampup is not None:
+                ema_nimg = min(ema_nimg, cur_nimg * ema_rampup)
+            ema_beta = 0.5 ** (batch_size / max(ema_nimg, 1e-8))
+            for p_ema, p in zip(T_ema.parameters(), T.parameters()):
+                p_ema.copy_(p.lerp(p_ema, ema_beta))
+            for b_ema, b in zip(T_ema.buffers(), T.buffers()):
+                b_ema.copy_(b)
         
+
         # Update state.
         cur_nimg += batch_size
         batch_idx += 1
@@ -743,6 +758,7 @@ def training_loop_tl(
                 print()
                 print('Aborting...')
 
+        
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
             images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
@@ -762,31 +778,31 @@ def training_loop_tl(
 
                 img_aligned = torch.cat([G_ema.synthesis(ws_aligned_[None]) for ws_aligned_ in ws_aligned])
                 save_image_grid(img_aligned.cpu().numpy(), os.path.join(run_dir, f'fakes_aligned_{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
-
+        
         # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
-            snapshot_data = dict(G=G, G_ema=G_ema, T=T, T_ema=T_ema, L=L, augment_pipe=augment_pipe)#, training_set_kwargs=dict(training_set_kwargs))
+            snapshot_data = dict(G=G, G_ema=G_ema, T=T, L=L, augment_pipe=augment_pipe)#, training_set_kwargs=dict(training_set_kwargs))
             for key, value in snapshot_data.items():
                 if isinstance(value, torch.nn.Module):
                     # TODO : error when we try to snapshot T or T_ema... why??
                     # RuntimeError: Only Tensors created explicitly by the user (graph leaves) support the deepcopy protocol at the moment
-                    try:
-                        value = copy.deepcopy(value).eval().requires_grad_(False)
-                    except:
-                        print(type(value))
+                    #try:
+                    value = copy.deepcopy(value).eval().requires_grad_(False)
+
                     if num_gpus > 1:
                         misc.check_ddp_consistency(value, ignore_regex=r'.*\.[^.]+_(avg|ema)')
                         for param in misc.params_and_buffers(value):
                             torch.distributed.broadcast(param, src=0)
-                    snapshot_data[key] = value.cpu()
+                    snapshot_data[key] = value#.cpu()
                 del value # conserve memory
             snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
             if rank == 0:
                 with open(snapshot_pkl, 'wb') as f:
                     pickle.dump(snapshot_data, f)
-
+        
+        
         # Evaluate metrics.
         
         """
@@ -804,7 +820,7 @@ def training_loop_tl(
                     metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
                 stats_metrics.update(result_dict.results)
         """
-        del snapshot_data # conserve memory
+        #del snapshot_data # conserve memory
         
 
         # Collect statistics.
