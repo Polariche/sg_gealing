@@ -83,12 +83,14 @@ class DirectionInterpolator(nn.Module):
         with torch.no_grad():
             self.coefficients.copy_(initializer)
 
-    def random_sample(self, gen_z, magnitude, lat_mean=None):
+    def random_sample(self, gen_z, gen_w, magnitude, lat_mean=None):
         random_dir = torch.nn.functional.normalize(gen_z, dim=1)
 
         lat_mean = lat_mean if lat_mean is not None else self.lat_mean
         out = lat_mean + random_dir * magnitude
-        out = out.reshape(gen_z.shape[0], 1, 512).repeat(1, self.n_latent, 1)
+        out = out.reshape(gen_z.shape[0], 1, 512).repeat(1, self.inject_index, 1)
+
+        out = torch.cat([out, gen_w[:, self.inject_index:]], dim=1)
 
         return out
 

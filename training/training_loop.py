@@ -623,10 +623,11 @@ def training_loop_tl(
             grid_c = torch.zeros((labels_n, 0), device=device).split(batch_gpu) #torch.from_numpy(labels).to(device).split(batch_gpu)
 
             if loss_kwargs.fix_w_dist:
-                ws = torch.cat([L.random_sample(z, loss_kwargs.w_fixed_dist) for z, c in zip(grid_z, grid_c)])  
+                gen_w = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)]).split(batch_gpu)
+                ws = torch.cat([L.random_sample(z, w, loss_kwargs.w_fixed_dist) for z, w in zip(grid_z, gen_w)])  
             else:
                 ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
-            ws_aligned = L([ws[:, 0, :]], psi=torch.zeros((1), device=device))[0]
+            ws_aligned = L([ws[:, -1, :]], psi=torch.zeros((1), device=device))[0]
 
             images = torch.cat([G_ema.synthesis(ws_[None]) for ws_ in ws])
             save_image_grid(images.cpu().numpy(), os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
@@ -777,11 +778,12 @@ def training_loop_tl(
                 psi = 0.5 * (1 + torch.cos(torch.tensor(math.pi * min(cur_nimg//1000, psi_anneal)  / psi_anneal))).to(device)
 
                 if loss_kwargs.fix_w_dist:
-                    ws = torch.cat([L.random_sample(z, loss_kwargs.w_fixed_dist) for z, c in zip(grid_z, grid_c)])  
+                    gen_w = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)]).split(batch_gpu)
+                    ws = torch.cat([L.random_sample(z, w, loss_kwargs.w_fixed_dist) for z, w in zip(grid_z, gen_w)])  
                 else:
                     ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
 
-                ws_aligned = L([ws[:, 0, :]], psi=psi)[0]
+                ws_aligned = L([ws[:, -1, :]], psi=psi)[0]
 
                 
                 images = torch.cat([G_ema.synthesis(ws_[None]) for ws_ in ws])

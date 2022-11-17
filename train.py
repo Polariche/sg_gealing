@@ -259,7 +259,7 @@ def main(**kwargs):
     c.loss_kwargs.psi_anneal = 2000
     c.loss_kwargs.epsilon = 1
     c.loss_kwargs.fix_w_dist = True
-    c.loss_kwargs.w_fixed_dist = 1e-1
+    c.loss_kwargs.w_fixed_dist = 50
     
     # Augmentation.
     if opts.aug != 'noaug':
