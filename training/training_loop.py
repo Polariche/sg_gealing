@@ -499,15 +499,11 @@ def training_loop_tl(
     #common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution, img_channels=training_set.num_channels)
     common_kwargs = dict(c_dim=0, img_resolution=256, img_channels=3)
     G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
-    #D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     G_ema = copy.deepcopy(G).eval()
 
     # TODO : dnnlib-ify ??
-    #stn1 = SimilarityTransformer(256).requires_grad_(False).to(device)
-    #stn2 = PerspectiveTransformer(256).requires_grad_(False).to(device)
 
     T = TransformerSequence(**T_kwargs).train().requires_grad_(False).to(device)
-    #T = SimilarityTransformer(256, **T_kwargs).train().requires_grad_(False).to(device)
     T_ema = copy.deepcopy(T).eval()
 
     L = DirectionInterpolator(pca_path=None, n_comps=1, inject_index=5, n_latent=14, num_heads=1).to(device)
@@ -527,18 +523,30 @@ def training_loop_tl(
 
     
     n_pca = 1000# if args.debug else 1000000
-    #with torch.no_grad():
-        # randomly sample z -> map to w
-        #batch_w = G_ema.batch_latent(n_pca // get_world_size())
 
-    #    grid_z = torch.randn([n_pca, G_ema.z_dim], device=device).split(batch_gpu)
-    #    grid_c = torch.zeros((n_pca, 0), device=device).split(batch_gpu)
-    #    batch_w = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])[:, 0]
-
-    #batch_w = all_gather(batch_w)
-    #pca = PCA(1, batch_w)
-    #L.assign_buffers(pca)
+    if rank != 0 and num_gpus > 1:
+        torch.distributed.barrier() # leader goes first
         
+    if rank == 0 or num_gpus == 0:
+        with torch.no_grad():
+            # randomly sample z -> map to w
+            #batch_w = G_ema.batch_latent(n_pca // get_world_size())
+
+            grid_z = torch.randn([n_pca, G_ema.z_dim], device=device).split(batch_gpu)
+            grid_c = torch.zeros((n_pca, 0), device=device).split(batch_gpu)
+            batch_w = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])[:, 0]
+
+            #batch_w = all_gather(batch_w)
+            pca = PCA(1, batch_w)
+            L.assign_buffers(pca)
+
+    if rank == 0 and num_gpus > 1:
+            torch.distributed.barrier() # others follow
+
+    if num_gpus > 1:
+        for param in misc.params_and_buffers(L):
+            torch.distributed.broadcast(param, src=0)
+
 
     # Print network summary tables.
     if rank == 0:
