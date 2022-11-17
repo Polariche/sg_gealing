@@ -627,7 +627,7 @@ def training_loop_tl(
                 ws = torch.cat([L.random_sample(z, w, loss_kwargs.w_fixed_dist) for z, w in zip(grid_z, gen_w)])  
             else:
                 ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
-            ws_aligned = L([ws[:, -1, :]], psi=torch.zeros((1), device=device))[0]
+            ws_aligned = L(ws, psi=torch.zeros((1), device=device))[0]
 
             images = torch.cat([G_ema.synthesis(ws_[None]) for ws_ in ws])
             save_image_grid(images.cpu().numpy(), os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
@@ -783,7 +783,7 @@ def training_loop_tl(
                 else:
                     ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
 
-                ws_aligned = L([ws[:, -1, :]], psi=psi)[0]
+                ws_aligned = L(ws, psi=psi)[0]
 
                 
                 images = torch.cat([G_ema.synthesis(ws_[None]) for ws_ in ws])

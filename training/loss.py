@@ -60,7 +60,7 @@ class TransformerLoss(Loss):
             ws = G.mapping(z, c, update_emas=update_emas)
 
         if align:
-            ws_aligned = L([ws[:, -1, :]], psi=psi)[0]
+            ws_aligned = L(ws, psi=psi)[0]
             ws_input = torch.cat([ws, ws_aligned])
         else:
             ws_input = ws

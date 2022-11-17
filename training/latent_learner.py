@@ -56,16 +56,15 @@ class DirectionInterpolator(nn.Module):
             return self.interpolate(styled_latent, psi, lat_mean, unfold)
 
     def interpolate(self, styled_latent, psi, lat_mean=None, unfold=False):
-        assert len(styled_latent) == 1
-        styled_latent = styled_latent[0]  # (N, 512)
+        styled_latent = styled_latent  # (N, 14, 512)
         N = styled_latent.size(0)
         lat_mean = lat_mean if lat_mean is not None else self.lat_mean
         truncated_latents = lat_mean + (self.coefficients @ self.directions)  # (K, 512), K = number of clusters learned
         truncated_latents = truncated_latents.repeat(N, 1)  # (N*K, 512)
         styled_latent = styled_latent.repeat_interleave(self.num_heads, dim=0)  # (N*K, 512)
-        truncated_latents = truncated_latents.lerp(styled_latent, psi).unsqueeze(1).repeat(1, self.inject_index, 1)
-        styled_latent = styled_latent.unsqueeze(1)
-        fixed_latents = styled_latent.repeat(1, self.n_latent - self.inject_index, 1)
+        truncated_latents = truncated_latents.lerp(styled_latent[:, 0], psi).unsqueeze(1).repeat(1, self.inject_index, 1)
+        #styled_latent = styled_latent.unsqueeze(1)
+        fixed_latents = styled_latent[:, self.inject_index:] #.repeat(1, self.n_latent - self.inject_index, 1)
         out = torch.cat([truncated_latents, fixed_latents], dim=1)  # (N*K, n_latent, 512)
         if unfold:
             out = out.reshape(N, self.num_heads, self.n_latent, 512)
