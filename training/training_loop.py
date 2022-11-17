@@ -621,15 +621,15 @@ def training_loop_tl(
 
             grid_z = torch.randn([labels_n, G.z_dim], device=device).split(batch_gpu)
             grid_c = torch.zeros((labels_n, 0), device=device).split(batch_gpu) #torch.from_numpy(labels).to(device).split(batch_gpu)
-            images = torch.cat([G_ema(z=z, c=c, noise_mode='const') for z, c in zip(grid_z, grid_c)])
-            save_image_grid(images.cpu().numpy(), os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
-            mat_label = torch.cat([create_mat3D_from_gen_z(z * 1e-2) for z, c in zip(grid_z, grid_c)]) 
 
-            #images = T[1](images)#, prev_mat=mat_label)
-            #save_image_grid(images.cpu().numpy(), os.path.join(run_dir, 'fakes_transformed_init.png'), drange=[-1,1], grid_size=grid_size)
-
-            ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
+            if loss_kwargs.fix_w_dist:
+                ws = torch.cat([L.random_sample(z, loss_kwargs.w_fixed_dist) for z, c in zip(grid_z, grid_c)])  
+            else:
+                ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
             ws_aligned = L([ws[:, 0, :]], psi=torch.zeros((1), device=device))[0]
+
+            images = torch.cat([G_ema.synthesis(ws_[None]) for ws_ in ws])
+            save_image_grid(images.cpu().numpy(), os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
 
             img_aligned = torch.cat([G_ema.synthesis(ws_aligned_[None]) for ws_aligned_ in ws_aligned])
             save_image_grid(img_aligned.cpu().numpy(), os.path.join(run_dir, 'fakes_aligned_init.png'), drange=[-1,1], grid_size=grid_size)
@@ -773,16 +773,22 @@ def training_loop_tl(
             save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
 
             with torch.no_grad():
-                images = torch.cat([G_ema(z=z, c=c, noise_mode='const') for z, c in zip(grid_z, grid_c)])
-                save_image_grid(images.cpu().numpy(), os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
-
-                images = T(images)
-                save_image_grid(images.cpu().numpy(), os.path.join(run_dir, f'fakes_transformed_{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
-
                 psi_anneal = 2000
                 psi = 0.5 * (1 + torch.cos(torch.tensor(math.pi * min(cur_nimg//1000, psi_anneal)  / psi_anneal))).to(device)
-                ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
+
+                if loss_kwargs.fix_w_dist:
+                    ws = torch.cat([L.random_sample(z, loss_kwargs.w_fixed_dist) for z, c in zip(grid_z, grid_c)])  
+                else:
+                    ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
+
                 ws_aligned = L([ws[:, 0, :]], psi=psi)[0]
+
+                
+                images = torch.cat([G_ema.synthesis(ws_[None]) for ws_ in ws])
+                save_image_grid(images.cpu().numpy(), os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+
+                images_transformed = T(images)
+                save_image_grid(images_transformed.cpu().numpy(), os.path.join(run_dir, f'fakes_transformed_{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
 
                 img_aligned = torch.cat([G_ema.synthesis(ws_aligned_[None]) for ws_aligned_ in ws_aligned])
                 save_image_grid(img_aligned.cpu().numpy(), os.path.join(run_dir, f'fakes_aligned_{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)

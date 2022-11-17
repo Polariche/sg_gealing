@@ -256,7 +256,10 @@ def main(**kwargs):
             
     c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
     c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
+    c.loss_kwargs.psi_anneal = 2000
     c.loss_kwargs.epsilon = 1
+    c.loss_kwargs.fix_w_dist = True
+    c.loss_kwargs.w_fixed_dist = 1e-1
     
     # Augmentation.
     if opts.aug != 'noaug':
