@@ -29,7 +29,7 @@ class Loss:
 #----------------------------------------------------------------------------
 
 class TransformerLoss(Loss):
-    def __init__(self, device, G, T, L, vgg, augment_pipe=None, use_initial_depth_prob=0, blur_init_sigma=0, blur_fade_kimg=0, psi_anneal=2000, epsilon=1e-4):
+    def __init__(self, device, G, T, L, vgg, augment_pipe=None, use_initial_depth_prob=0, blur_init_sigma=0, blur_fade_kimg=0, psi_anneal=2000, epsilon=1e-4, w_fixed_dist = 1e-1):
         super().__init__()
 
         print("HI")
@@ -46,14 +46,19 @@ class TransformerLoss(Loss):
         self.psi_anneal         = psi_anneal
         self.augment_pipe       = augment_pipe
         self.epsilon            = epsilon
+        self.w_fixed_dist       = w_fixed_dist
 
-    def run_G(self, z, c, align=False, psi=None, update_emas=False):
+    def run_G(self, z, c, align=False, psi=None, fix_w_dist=False, update_emas=False):
         G = self.G
-        ws = G.mapping(z, c, update_emas=update_emas)
-        #img = G.synthesis(ws, update_emas=update_emas)
+        L = self.L
+
+        if fix_w_dist:
+            ws = L.random_sample(z, self.w_fixed_dist)
+        else:
+            ws = G.mapping(z, c, update_emas=update_emas)
 
         if align:
-            ws_aligned = self.L([ws[:, 0, :]], psi=psi)[0]
+            ws_aligned = L([ws[:, 0, :]], psi=psi)[0]
             ws_input = torch.cat([ws, ws_aligned])
         else:
             ws_input = ws
@@ -83,7 +88,7 @@ class TransformerLoss(Loss):
             return transformed_img
 
 
-    def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg): # to be overridden by subclass
+    def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg, fix_w_dist=False): # to be overridden by subclass
         # set up constants
         blur_sigma = max(1 - cur_nimg / (self.blur_fade_kimg * 1e3), 0) * self.blur_init_sigma if self.blur_fade_kimg > 0 else 0
         
@@ -95,7 +100,7 @@ class TransformerLoss(Loss):
 
         # run G & T
         with torch.autograd.profiler.record_function('Gmain_forward'):
-            img, ws, img_aligned, ws_aligned = self.run_G(gen_z, gen_c, align=True, psi=psi)
+            img, ws, img_aligned, ws_aligned = self.run_G(gen_z, gen_c, align=True, psi=psi, fix_w_dist=fix_w_dist)
 
             transformed_img = self.run_T(img.detach(), return_full=False, blur_sigma=blur_sigma)
             img = torch.cat([transformed_img, img_aligned], dim=0)

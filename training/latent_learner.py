@@ -83,6 +83,13 @@ class DirectionInterpolator(nn.Module):
         with torch.no_grad():
             self.coefficients.copy_(initializer)
 
+    def random_sample(self, gen_z, magnitude, lat_mean=None):
+        random_dir = F.normalize(gen_z, dim=1)
+
+        lat_mean = lat_mean if lat_mean is not None else self.lat_mean
+        out = lat_mean + random_dir * magnitude
+
+        return out
 
 @torch.no_grad()
 def kmeans_plusplus(num_heads, num_latent, G, loss_fn, inject_index=6, batch_size=100):
