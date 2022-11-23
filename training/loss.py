@@ -58,16 +58,15 @@ class TransformerLoss(Loss):
 
         if self.fix_w_dist:
             ws = G.mapping(z, c, update_emas=update_emas)
-            #ws[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], self.pose_trunc_dist)
-            #ws = L.random_sample(z, ws, self.w_fixed_dist)
+            ws[:, :self.pose_layers] = w_avg + torch.nn.functional.normalize(ws[:, :self.pose_layers] - w_avg, dim=-1) * 10 * self.pose_trunc_dist
         else:
             ws = G.mapping(z, c, update_emas=update_emas)
-            #ws[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], self.pose_trunc_dist)
+            ws[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], self.pose_trunc_dist)
 
         if align:
             #ws_aligned = L(ws, psi=psi)[0]
             ws_aligned = ws.clone()
-            ws_aligned[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], 1)
+            ws_aligned[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], psi)
 
             ws_input = torch.cat([ws, ws_aligned])
         else:

@@ -634,7 +634,9 @@ def training_loop_tl(
 
             ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
             if fix_w_dist:
-                ws[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], pose_trunc_dist)
+                ws[:, :pose_layers] = w_avg + torch.nn.functional.normalize(ws[:, :pose_layers] - w_avg, dim=-1) * 10 * pose_trunc_dist
+                #print(torch.linalg.norm(ws[:, :pose_layers] - w_avg, dim=-1))
+                #pass
             else:
                 ws[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], pose_trunc_dist)
 
@@ -786,12 +788,12 @@ def training_loop_tl(
             save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
 
             with torch.no_grad():
-                psi_anneal = 2000
+                psi_anneal = loss_kwargs.psi_anneal
                 psi = 0.5 * (1 + torch.cos(torch.tensor(math.pi * min(cur_nimg//1000, psi_anneal)  / psi_anneal))).to(device)
 
                 ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
                 if fix_w_dist:
-                    ws[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], pose_trunc_dist)
+                    ws[:, :pose_layers] = w_avg + torch.nn.functional.normalize(ws[:, :pose_layers] - w_avg, dim=-1) * 10 * pose_trunc_dist
                 else:
                     ws[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], pose_trunc_dist)
 

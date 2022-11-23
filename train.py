@@ -151,6 +151,7 @@ def parse_comma_separated_list(s):
 @click.option('--dlr',          help='D learning rate', metavar='FLOAT',                        type=click.FloatRange(min=0), default=0.002, show_default=True)
 @click.option('--map-depth',    help='Mapping network depth  [default: varies]', metavar='INT', type=click.IntRange(min=1))
 @click.option('--mbstd-group',  help='Minibatch std group size', metavar='INT',                 type=click.IntRange(min=1), default=4, show_default=True)
+@click.option('--psi-anneal',   help='Psi annealing rate for pose latents', metavar='INT',      type=click.IntRange(min=1), default=2000)
 
 # Misc settings.
 @click.option('--desc',         help='String to include in result dir name', metavar='STR',     type=str)
@@ -210,8 +211,8 @@ def main(**kwargs):
     c.batch_size = opts.batch
     c.batch_gpu = opts.batch_gpu or opts.batch // opts.gpus
 
-    c.pose_trunc_dist = 1
-    c.fix_w_dist = False
+    c.pose_trunc_dist = 0.5
+    c.fix_w_dist = True
     c.pose_layers = 5
 
     c.G_kwargs.channel_base = opts.cbase # = c.D_kwargs.channel_base 
@@ -261,7 +262,7 @@ def main(**kwargs):
             
     c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
     c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
-    c.loss_kwargs.psi_anneal = 2000
+    c.loss_kwargs.psi_anneal = opts.psi_anneal
     c.loss_kwargs.epsilon = 1
     #c.loss_kwargs.fix_w_dist = True
     #c.loss_kwargs.w_fixed_dist = 50
