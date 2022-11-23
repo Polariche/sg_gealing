@@ -440,7 +440,7 @@ def training_loop_tl(
     G_kwargs                = {},       # Options for generator network.
     T_kwargs                = {},
     T_opt_kwargs            = {},
-    #D_kwargs                = {},       # Options for discriminator network.
+    #D_kwargs                = {},       # Options for discriminator network
     #G_opt_kwargs            = {},       # Options for generator optimizer.
     #D_opt_kwargs            = {},       # Options for discriminator optimizer.
     augment_kwargs          = None,     # Options for augmentation pipeline. None = disable.
@@ -451,6 +451,9 @@ def training_loop_tl(
     rank                    = 0,        # Rank of the current process in [0, num_gpus[.
     batch_size              = 4,        # Total batch size for one training iteration. Can be larger than batch_gpu * num_gpus.
     batch_gpu               = 4,        # Number of samples processed at a time by one GPU.
+    pose_trunc_dist              = 1,
+    pose_layers             = 5,
+    fix_w_dist              = False,
     ema_kimg                = 10,       # Half-life of the exponential moving average (EMA) of generator weights.
     ema_rampup              = 0.05,     # EMA ramp-up coefficient. None = no rampup.
     G_reg_interval          = None,     # How often to perform regularization for G? None = disable lazy regularization.
@@ -506,12 +509,11 @@ def training_loop_tl(
     T = TransformerSequence(**T_kwargs).train().requires_grad_(False).to(device)
     T_ema = copy.deepcopy(T).eval()
 
-    L = DirectionInterpolator(pca_path=None, n_comps=1, inject_index=5, n_latent=14, num_heads=1).to(device)
+    #L = DirectionInterpolator(pca_path=None, n_comps=1, inject_index=5, n_latent=14, num_heads=1).to(device)
 
 
     vgg16_url = './pretrained/vgg16.pkl' #'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/vgg16.pkl'
     vgg16 = metric_utils.get_feature_detector(vgg16_url, num_gpus=num_gpus, rank=rank,  verbose=True).requires_grad_(False).to(device)
-    #vgg16 = None
 
     # Resume from existing pickle.
     if (resume_pkl is not None) and (rank == 0):
@@ -538,15 +540,19 @@ def training_loop_tl(
 
             #batch_w = all_gather(batch_w)
             pca = PCA(1, batch_w)
-            L.assign_buffers(pca)
+
+            # TODO: make use of w-direction from pca
+
+            #L.assign_buffers(pca)
 
     if rank == 0 and num_gpus > 1:
             torch.distributed.barrier() # others follow
 
+    """
     if num_gpus > 1:
         for param in misc.params_and_buffers(L):
             torch.distributed.broadcast(param, src=0)
-
+    """
 
     # Print network summary tables.
     if rank == 0:
@@ -572,7 +578,7 @@ def training_loop_tl(
         print(f'Distributing across {num_gpus} GPUs...')
     
 
-    for module in [G, G_ema, T, T_ema, L, augment_pipe, vgg16]: #D
+    for module in [G, G_ema, T, T_ema, augment_pipe, vgg16]: #D
         if module is not None and num_gpus > 1:
             for param in misc.params_and_buffers(module):
                 torch.distributed.broadcast(param, src=0)
@@ -582,7 +588,9 @@ def training_loop_tl(
     if rank == 0:
         print('Setting up training phases...')
     #loss = dnnlib.util.construct_class_by_name(device=device, G=G, D=D, augment_pipe=augment_pipe, **loss_kwargs) # subclass of training.loss.Loss
-    loss = dnnlib.util.construct_class_by_name(device=device, G=G, T=T, L=L, vgg=vgg16, augment_pipe=augment_pipe, **loss_kwargs)
+    loss = dnnlib.util.construct_class_by_name(device=device, G=G, T=T, 
+                                                    pose_layers=pose_layers, pose_trunc_dist=pose_trunc_dist, fix_w_dist=fix_w_dist, 
+                                                    vgg=vgg16, augment_pipe=augment_pipe, **loss_kwargs)
 
 
     phases = []
@@ -610,6 +618,8 @@ def training_loop_tl(
     grid_z = None
     grid_c = None
 
+    w_avg = G_ema.mapping.w_avg
+
     if rank == 0:
         print('Exporting sample images...')
         #grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
@@ -622,12 +632,14 @@ def training_loop_tl(
             grid_z = torch.randn([labels_n, G.z_dim], device=device).split(batch_gpu)
             grid_c = torch.zeros((labels_n, 0), device=device).split(batch_gpu) #torch.from_numpy(labels).to(device).split(batch_gpu)
 
-            if loss_kwargs.fix_w_dist:
-                gen_w = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)]).split(batch_gpu)
-                ws = torch.cat([L.random_sample(z, w, loss_kwargs.w_fixed_dist) for z, w in zip(grid_z, gen_w)])  
+            ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
+            if fix_w_dist:
+                ws[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], pose_trunc_dist)
             else:
-                ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
-            ws_aligned = L(ws, psi=torch.zeros((1), device=device))[0]
+                ws[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], pose_trunc_dist)
+
+            ws_aligned = ws.clone()
+            ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], 0)
 
             images = torch.cat([G_ema.synthesis(ws_[None]) for ws_ in ws])
             save_image_grid(images.cpu().numpy(), os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
@@ -777,13 +789,14 @@ def training_loop_tl(
                 psi_anneal = 2000
                 psi = 0.5 * (1 + torch.cos(torch.tensor(math.pi * min(cur_nimg//1000, psi_anneal)  / psi_anneal))).to(device)
 
-                if loss_kwargs.fix_w_dist:
-                    gen_w = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)]).split(batch_gpu)
-                    ws = torch.cat([L.random_sample(z, w, loss_kwargs.w_fixed_dist) for z, w in zip(grid_z, gen_w)])  
+                ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
+                if fix_w_dist:
+                    ws[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], pose_trunc_dist)
                 else:
-                    ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
+                    ws[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], pose_trunc_dist)
 
-                ws_aligned = L(ws, psi=psi)[0]
+                ws_aligned = ws.clone()
+                ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], psi)
 
                 
                 images = torch.cat([G_ema.synthesis(ws_[None]) for ws_ in ws])
@@ -799,7 +812,7 @@ def training_loop_tl(
         snapshot_pkl = None
         snapshot_data = None
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
-            snapshot_data = dict(G=G, G_ema=G_ema, T=T, L=L, augment_pipe=augment_pipe)#, training_set_kwargs=dict(training_set_kwargs))
+            snapshot_data = dict(G=G, G_ema=G_ema, T=T, augment_pipe=augment_pipe)#, training_set_kwargs=dict(training_set_kwargs))
             for key, value in snapshot_data.items():
                 if isinstance(value, torch.nn.Module):
                     # TODO : error when we try to snapshot T or T_ema... why??

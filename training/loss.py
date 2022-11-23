@@ -29,7 +29,7 @@ class Loss:
 #----------------------------------------------------------------------------
 
 class TransformerLoss(Loss):
-    def __init__(self, device, G, T, L, vgg, augment_pipe=None, use_initial_depth_prob=0, blur_init_sigma=0, blur_fade_kimg=0, psi_anneal=2000, epsilon=1e-4, fix_w_dist = False, w_fixed_dist = 1e-1):
+    def __init__(self, device, G, T, vgg, augment_pipe=None, use_initial_depth_prob=0, blur_init_sigma=0, blur_fade_kimg=0, psi_anneal=2000, epsilon=1e-4, pose_layers=5, fix_w_dist = False, pose_trunc_dist = 1, ):
         super().__init__()
 
         print("HI")
@@ -37,7 +37,7 @@ class TransformerLoss(Loss):
         self.device = device
         self.G = G          # Generator
         self.T = T          # Transformer
-        self.L = L          # Latent Learner
+        #self.L = L          # Latent Learner
         self.vgg = vgg
 
         self.use_initial_depth_prob = use_initial_depth_prob 
@@ -46,21 +46,29 @@ class TransformerLoss(Loss):
         self.psi_anneal         = psi_anneal
         self.augment_pipe       = augment_pipe
         self.epsilon            = epsilon
-        self.w_fixed_dist       = w_fixed_dist
+        self.pose_layers        = pose_layers
+        self.pose_trunc_dist    = pose_trunc_dist
         self.fix_w_dist         = fix_w_dist
 
-    def run_G(self, z, c, align=False, psi=None, fix_w_dist=False, update_emas=False):
-        G = self.G
-        L = self.L
 
-        if fix_w_dist:
+    def run_G(self, z, c, align=False, psi=None, update_emas=False):
+        G = self.G
+        #L = self.L
+        w_avg = G.mapping.w_avg
+
+        if self.fix_w_dist:
             ws = G.mapping(z, c, update_emas=update_emas)
-            ws = L.random_sample(z, ws, self.w_fixed_dist)
+            #ws[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], self.pose_trunc_dist)
+            #ws = L.random_sample(z, ws, self.w_fixed_dist)
         else:
             ws = G.mapping(z, c, update_emas=update_emas)
+            #ws[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], self.pose_trunc_dist)
 
         if align:
-            ws_aligned = L(ws, psi=psi)[0]
+            #ws_aligned = L(ws, psi=psi)[0]
+            ws_aligned = ws.clone()
+            ws_aligned[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], 1)
+
             ws_input = torch.cat([ws, ws_aligned])
         else:
             ws_input = ws
@@ -102,7 +110,7 @@ class TransformerLoss(Loss):
 
         # run G & T
         with torch.autograd.profiler.record_function('Gmain_forward'):
-            img, ws, img_aligned, ws_aligned = self.run_G(gen_z, gen_c, align=True, psi=psi, fix_w_dist=self.fix_w_dist)
+            img, ws, img_aligned, ws_aligned = self.run_G(gen_z, gen_c, align=True, psi=psi)
 
             transformed_img = self.run_T(img.detach(), return_full=False, blur_sigma=blur_sigma)
             img = torch.cat([transformed_img, img_aligned], dim=0)

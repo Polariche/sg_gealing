@@ -319,6 +319,13 @@ def main(
             '/home/sooa/Projects/sg_gealing/~/training-runs/00186-stylegan2-lsun_cat-gpus1-batch8/network-snapshot-000000.pkl',
             '/home/sooa/Projects/sg_gealing/~/training-runs/00077-stylegan2-lsun_cat-gpus1-batch8/network-snapshot-000196.pkl',
             '/home/sooa/Gits/gangealing/pretrained/cat.pt',
+            '/home/sooa/Projects/sg_gealing/~/training-runs//network-snapshot-000456.pkl',
+            '/home/sooa/Projects/sg_gealing/~/training-runs//network-snapshot-000000.pkl',
+            '/home/sooa/Projects/sg_gealing/~/training-runs//network-snapshot-001096.pkl',
+            '/home/sooa/Projects/sg_gealing/~/training-runs//network-snapshot-001116.pkl',
+            '/mounted_data/experiments/00181-stylegan2-lsun_cat-gpus8-batch32/network-snapshot-002304.pkl',
+            '/mounted_data/experiments/00181-stylegan2-lsun_cat-gpus8-batch32/network-snapshot-002304.pkl',
+            '/mounted_data/experiments/00181-stylegan2-lsun_cat-gpus8-batch32/network-snapshot-002816.pkl',
         ]
 
         # Populate recent pickles list with pretrained model URLs.

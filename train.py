@@ -209,6 +209,11 @@ def main(**kwargs):
     c.num_gpus = opts.gpus
     c.batch_size = opts.batch
     c.batch_gpu = opts.batch_gpu or opts.batch // opts.gpus
+
+    c.pose_trunc_dist = 1
+    c.fix_w_dist = False
+    c.pose_layers = 5
+
     c.G_kwargs.channel_base = opts.cbase # = c.D_kwargs.channel_base 
     c.G_kwargs.channel_max = opts.cmax # = c.D_kwargs.channel_max 
     c.G_kwargs.mapping_kwargs.num_layers = (8 if opts.cfg == 'stylegan2' else 2) if opts.map_depth is None else opts.map_depth
@@ -258,8 +263,8 @@ def main(**kwargs):
     c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
     c.loss_kwargs.psi_anneal = 2000
     c.loss_kwargs.epsilon = 1
-    c.loss_kwargs.fix_w_dist = True
-    c.loss_kwargs.w_fixed_dist = 50
+    #c.loss_kwargs.fix_w_dist = True
+    #c.loss_kwargs.w_fixed_dist = 50
     
     # Augmentation.
     if opts.aug != 'noaug':
