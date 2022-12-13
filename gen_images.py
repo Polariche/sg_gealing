@@ -113,7 +113,7 @@ def generate_images(
 
         G = pkl['G_ema'].to(device) # type: ignore
         T = pkl['T'].to(device) # type: ignore
-        L = pkl['L'].to(device)
+        #L = pkl['L'].to(device)
 
     os.makedirs(outdir, exist_ok=True)
 
@@ -127,9 +127,18 @@ def generate_images(
         if class_idx is not None:
             print ('warn: --class=lbl ignored when running on an unconditional network')
 
-    #stn = TransformerSequence(256).to(device)
 
-    #L = DirectionInterpolator(pca_path=None, n_comps=1, inject_index=5, n_latent=14, num_heads=1).to(device)
+    T0_outs = []
+    T1_outs = []
+
+    def hook_fn1(m, i, o):
+        T0_outs.append(o)
+
+    def hook_fn2(m, i, o):
+        T1_outs.append(o)
+
+    T[0].epilogue.register_forward_hook(hook_fn1)
+    T[1].epilogue.register_forward_hook(hook_fn2)
 
     # Generate images.
     for seed_idx, seed in enumerate(seeds):
@@ -150,6 +159,8 @@ def generate_images(
         img0 = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         PIL.Image.fromarray(img0[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_original.png')
 
+        
+
         # transform
         blur_sigma = max(1 - 10000 / (1000 * 1e3), 0) * 2
         img, _, depth = T(img, blur_sigma = blur_sigma, return_full=True, iters=1)
@@ -165,15 +176,28 @@ def generate_images(
         depth = (depth.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         PIL.Image.fromarray(depth[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_depth.png')
 
-        w1 = G.mapping(z, label)
-        ws =  L(w1, psi=0)
+        
+        #print()
 
-        img2 = G.synthesis(ws[0])
+        w_avg = G.mapping.w_avg
+
+        ws = G.mapping(z, label)
+        ws[:, :5] = w_avg.lerp(ws[:, :5], 0)
+        #ws =  L(w1, psi=0)
+
+        img2 = G.synthesis(ws)
         img2 = (img2.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         PIL.Image.fromarray(img2[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_fixed.png')
 
 
         # Calculate final W.
+    
+    T0_outs = torch.cat(T0_outs)
+    T1_outs = torch.cat(T1_outs)
+
+    T_outs = torch.cat([T0_outs, T1_outs], dim=1)
+
+    
         
 #----------------------------------------------------------------------------
 

@@ -124,10 +124,9 @@ def upgrade_2Dmat_to_3Dmat(matrix):
     
     return M_3x4
 
-def create_mat3D_from_gen_z(gen_z):
-    params_label = gen_z[:, :6]
-    mat2d_label = create_affine_mat2D(*torch.split(params_label[:, :4], 1, dim=1))
-    mat3d_label = create_affine_mat3D(None,None,None,None, *torch.split(params_label[:, 4:], 1, dim=1))
+def create_mat3D_from_6params(params):
+    mat2d_label = create_affine_mat2D(*torch.split(params[:, :4], 1, dim=1))
+    mat3d_label = create_affine_mat3D(None,None,None,None, *torch.split(params[:, 4:], 1, dim=1))
     mat_label = upgrade_2Dmat_to_3Dmat(mat2d_label) @ convert_square_mat(mat3d_label)
 
     return mat_label
@@ -570,6 +569,8 @@ class PerspectiveTransformer(Transformer):
 
             depth = F.interpolate(depth, (H, W), mode='bilinear')
             depth = depth.permute(0,2,3,1)
+
+            #depth = torch.ones_like(depth) * default_camera_dist
 
 
         # --------------- prepare sampling grid ---------------------------------------------
