@@ -26,7 +26,7 @@ from torch_utils.ops import grid_sample_gradfix
 import legacy
 from metrics import metric_main, metric_utils
 
-from training.transformers import SimilarityTransformer, PerspectiveTransformer, TransformerSequence, create_mat3D_from_gen_z
+from training.transformers import SimilarityTransformer, PerspectiveTransformer, TransformerSequence
 from training.loss import TransformerLoss
 from training.latent_learner import DirectionInterpolator, PCA
 
@@ -634,14 +634,18 @@ def training_loop_tl(
 
             ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
             if fix_w_dist:
-                ws[:, :pose_layers] = w_avg + torch.nn.functional.normalize(ws[:, :pose_layers] - w_avg, dim=-1) * 10 * pose_trunc_dist
+                ws[:, :pose_layers] = w_avg + torch.nn.functional.normalize(ws[:, :pose_layers] - w_avg, dim=-1) * 1 * 10 * pose_trunc_dist
                 #print(torch.linalg.norm(ws[:, :pose_layers] - w_avg, dim=-1))
                 #pass
             else:
                 ws[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], pose_trunc_dist)
 
             ws_aligned = ws.clone()
-            ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], 0)
+            #ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], 0)
+            ws_align_dir = torch.nn.functional.normalize(torch.randn(ws_aligned[:, :pose_layers].shape, device=device)) * pose_trunc_dist * 10
+            ws_align_dir = torch.sign((ws_align_dir * (ws[:, :pose_layers] - w_avg)).sum(dim=-1, keepdim=True)) * ws_align_dir 
+            ws_aligned[:, :pose_layers] = ws[:, :pose_layers] + ws_align_dir
+
 
             images = torch.cat([G_ema.synthesis(ws_[None]) for ws_ in ws])
             save_image_grid(images.cpu().numpy(), os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
@@ -798,9 +802,11 @@ def training_loop_tl(
                     ws[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], pose_trunc_dist)
 
                 ws_aligned = ws.clone()
-                ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], psi)
+                #ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], psi)
+                ws_align_dir = torch.nn.functional.normalize(torch.randn(ws_aligned[:, :pose_layers].shape, device=device)) * pose_trunc_dist * (1-psi) * 1 * 10
+                ws_align_dir = torch.sign((ws_align_dir * (ws[:, :pose_layers] - w_avg)).sum(dim=-1, keepdim=True)) * ws_align_dir 
+                ws_aligned[:, :pose_layers] = ws[:, :pose_layers] + ws_align_dir
 
-                
                 images = torch.cat([G_ema.synthesis(ws_[None]) for ws_ in ws])
                 save_image_grid(images.cpu().numpy(), os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
 

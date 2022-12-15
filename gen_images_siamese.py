@@ -140,6 +140,8 @@ def generate_images(
     T[0].epilogue.register_forward_hook(hook_fn1)
     T[1].epilogue.register_forward_hook(hook_fn2)
 
+    imgs = []
+
     # Generate images.
     for seed_idx, seed in enumerate(seeds):
         print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
@@ -155,37 +157,27 @@ def generate_images(
 
         # generate the original image
         img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
+        imgs.append(img.squeeze(0))
+    
+    imgs = torch.stack(imgs, dim=0)
+    imgs = imgs.view(-1, 2, *imgs.shape[1:])
 
+    def save_img(img, filename):
         img0 = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-        PIL.Image.fromarray(img0[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_original.png')
+        PIL.Image.fromarray(img0[0].cpu().numpy(), 'RGB').save(filename)
 
-        
+    for i, img in enumerate(imgs):
+        img1, img2 = torch.chunk(img, 2, dim=0)
+
+        save_img(img1, f'{outdir}/batch{i:04d}_1.png')
+        save_img(img2, f'{outdir}/batch{i:04d}_3.png')
 
         # transform
         blur_sigma = max(1 - 10000 / (1000 * 1e3), 0) * 2
-        img, _, depth = T(img, blur_sigma = blur_sigma, return_full=True, iters=1)
+        img1_t, img2_t = T.siamese_forward(img1, img2, blur_sigma = blur_sigma, return_full=True, iters=1)
         
-
-        img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-        PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
-
-        # normalize & RGB
-        normalized_depth = (depth - depth.min()) / (depth.max() - depth.min()) 
-        depth = torch.cat([normalized_depth]*3, dim=-1).permute(0, 3, 1, 2)
-
-        depth = (depth.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-        PIL.Image.fromarray(depth[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_depth.png')
-
-
-        w_avg = G.mapping.w_avg
-
-        ws = G.mapping(z, label)
-        ws[:, :5] = w_avg.lerp(ws[:, :5], 0)
-        #ws =  L(w1, psi=0)
-
-        img2 = G.synthesis(ws)
-        img2 = (img2.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-        PIL.Image.fromarray(img2[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}_fixed.png')
+        save_img(img1_t, f'{outdir}/batch{i:04d}_2.png')
+        save_img(img2_t, f'{outdir}/batch{i:04d}_4.png')
 
 
         # Calculate final W.

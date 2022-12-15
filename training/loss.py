@@ -16,9 +16,6 @@ from torch_utils.ops import upfirdn2d
 
 import math
 
-from training.lpips import get_perceptual_loss
-from training.transformers import convert_square_mat, create_mat3D_from_gen_z
-
 
 #----------------------------------------------------------------------------
 
@@ -26,9 +23,10 @@ class Loss:
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg): # to be overridden by subclass
         raise NotImplementedError()
 
+
 #----------------------------------------------------------------------------
 
-class TransformerLoss(Loss):
+class TransformerSiameseLoss(Loss):
     def __init__(self, device, G, T, vgg, augment_pipe=None, use_initial_depth_prob=0, blur_init_sigma=0, blur_fade_kimg=0, psi_anneal=2000, epsilon=1e-4, pose_layers=5, fix_w_dist = False, pose_trunc_dist = 1, ):
         super().__init__()
 
@@ -37,7 +35,6 @@ class TransformerLoss(Loss):
         self.device = device
         self.G = G          # Generator
         self.T = T          # Transformer
-        #self.L = L          # Latent Learner
         self.vgg = vgg
 
         self.use_initial_depth_prob = use_initial_depth_prob 
@@ -51,9 +48,91 @@ class TransformerLoss(Loss):
         self.fix_w_dist         = fix_w_dist
 
 
-    def run_G(self, z, c, align=False, psi=None, update_emas=False):
+    def run_G(self, z, c, psi=None, update_emas=False):
         G = self.G
-        #L = self.L
+        w_avg = G.mapping.w_avg
+
+        if self.fix_w_dist:
+            ws = G.mapping(z, c, update_emas=update_emas)
+            ws[:, :self.pose_layers] = w_avg + torch.nn.functional.normalize(ws[:, :self.pose_layers] - w_avg, dim=-1) * 1 * 10 * self.pose_trunc_dist
+        else:
+            ws = G.mapping(z, c, update_emas=update_emas)
+            ws[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], self.pose_trunc_dist)
+
+        ws_aligned = ws.clone()
+        ws_align_dir = torch.nn.functional.normalize(torch.randn(ws_aligned[:, :self.pose_layers].shape, device=self.device)) * self.pose_trunc_dist * (1-psi)  * 10
+        ws_align_dir = torch.sign((ws_align_dir * (ws[:, :self.pose_layers] - w_avg)).sum(dim=-1, keepdim=True)) * ws_align_dir 
+        ws_aligned[:, :self.pose_layers] = ws[:, :self.pose_layers] + ws_align_dir
+
+        ws_input = torch.cat([ws, ws_aligned])
+
+        img_set = G.synthesis(ws_input, update_emas=update_emas)
+
+        img, img_aligned = img_set.chunk(2)
+        return img, ws, img_aligned, ws_aligned
+
+
+    def run_T(self, img1, img2, blur_sigma=0, update_emas=False):
+        #if self.augment_pipe is not None:
+        #    img = self.augment_pipe(img)
+
+        img2_new, img1_new = self.T.siamese_forward(img1, img2, blur_sigma=blur_sigma, update_emas=update_emas)
+        return img1_new, img2_new
+        
+
+
+    def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg): # to be overridden by subclass
+        # set up constants
+        blur_sigma = max(1 - cur_nimg / (self.blur_fade_kimg * 1e3), 0) * self.blur_init_sigma if self.blur_fade_kimg > 0 else 0
+        
+        # cosine anneal, from gangealing.utils.annealing.cosine_anneal
+        psi = 0.5 * (1 + torch.cos(torch.tensor(math.pi * min(cur_nimg//1000, self.psi_anneal) / self.psi_anneal)))
+        psi = psi.to(self.device)
+
+        training_stats.report('Loss/psi', psi)
+
+        # run G & T
+        with torch.autograd.profiler.record_function('Gmain_forward'):
+            img_1, ws_1, img_2, ws_2 = self.run_G(gen_z, gen_c, psi=psi)
+
+            transformed_1, transformed_2 = self.run_T(img_1.detach(), img_2.detach(), return_full=False, blur_sigma=blur_sigma)
+            img = torch.cat([img_1, img_2, transformed_1, transformed_2], dim=0)
+            
+            lpips_t0, lpips_t1 = self.vgg(img, resize_images=False, return_lpips=True).chunk(2)
+            perceptual_loss= (lpips_t0 - lpips_t1).square().sum(1) / self.epsilon ** 2
+            training_stats.report('Loss/perceptual_loss', perceptual_loss)
+
+        with torch.autograd.profiler.record_function('Gmain_backward'):
+            perceptual_loss.mean().mul(gain).backward()
+
+            #pass
+
+#----------------------------------------------------------------------------
+
+class TransformerLoss(Loss):
+    def __init__(self, device, G, T, vgg, augment_pipe=None, use_initial_depth_prob=0, blur_init_sigma=0, blur_fade_kimg=0, psi_anneal=2000, epsilon=1e-4, pose_layers=5, fix_w_dist = False, pose_trunc_dist = 1, ):
+        super().__init__()
+
+        print("HI")
+
+        self.device = device
+        self.G = G          # Generator
+        self.T = T          # Transformer
+        self.vgg = vgg
+
+        self.use_initial_depth_prob = use_initial_depth_prob 
+        self.blur_init_sigma    = blur_init_sigma
+        self.blur_fade_kimg     = blur_fade_kimg
+        self.psi_anneal         = psi_anneal
+        self.augment_pipe       = augment_pipe
+        self.epsilon            = epsilon
+        self.pose_layers        = pose_layers
+        self.pose_trunc_dist    = pose_trunc_dist
+        self.fix_w_dist         = fix_w_dist
+
+
+    def run_G(self, z, c, psi=None, update_emas=False):
+        G = self.G
         w_avg = G.mapping.w_avg
 
         if self.fix_w_dist:
@@ -63,23 +142,16 @@ class TransformerLoss(Loss):
             ws = G.mapping(z, c, update_emas=update_emas)
             ws[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], self.pose_trunc_dist)
 
-        if align:
-            #ws_aligned = L(ws, psi=psi)[0]
-            ws_aligned = ws.clone()
-            ws_aligned[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], psi)
+        ws_aligned = ws.clone()
+        ws_aligned[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], psi)
 
-            ws_input = torch.cat([ws, ws_aligned])
-        else:
-            ws_input = ws
+        ws_input = torch.cat([ws, ws_aligned])
 
         img_set = G.synthesis(ws_input, update_emas=update_emas)
 
-        if align:
-            img, img_aligned = img_set.chunk(2)
-            return img, ws, img_aligned, ws_aligned
-        else:
-            img = img_set
-            return img, ws
+        img, img_aligned = img_set.chunk(2)
+        return img, ws, img_aligned, ws_aligned
+
 
     def run_T(self, img, blur_sigma=0, return_full=False, update_emas=False):
         #if self.augment_pipe is not None:
@@ -109,7 +181,7 @@ class TransformerLoss(Loss):
 
         # run G & T
         with torch.autograd.profiler.record_function('Gmain_forward'):
-            img, ws, img_aligned, ws_aligned = self.run_G(gen_z, gen_c, align=True, psi=psi)
+            img, ws, img_aligned, ws_aligned = self.run_G(gen_z, gen_c, psi=psi)
 
             transformed_img = self.run_T(img.detach(), return_full=False, blur_sigma=blur_sigma)
             img = torch.cat([transformed_img, img_aligned], dim=0)
