@@ -64,10 +64,16 @@ class TransformerSiameseLoss(Loss):
         ws_align_dir = torch.nn.functional.normalize(torch.randn(ws_aligned[:, :self.pose_layers].shape, device=self.device)) * self.pose_trunc_dist * (1-psi)  * 10
         ws_align_dir = torch.sign((ws_align_dir * (ws[:, :self.pose_layers] - w_avg)).sum(dim=-1, keepdim=True)) * ws_align_dir 
         ws_aligned[:, :self.pose_layers] = ws[:, :self.pose_layers] + ws_align_dir
-        """
+        
 
         ws_aligned = ws.clone()
         ws_aligned[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], psi)
+        """
+
+        ws_aligned = ws.clone()
+        rand_ind = torch.randperm(ws.shape[0])
+        ws_aligned[:, :self.pose_layers] = ws[rand_ind, :self.pose_layers].lerp(ws[:, :self.pose_layers], psi)
+
 
         ws_input = torch.cat([ws, ws_aligned])
 

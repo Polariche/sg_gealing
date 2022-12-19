@@ -641,7 +641,10 @@ def training_loop_tl(
                 ws[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], pose_trunc_dist)
 
             ws_aligned = ws.clone()
-            ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], 0)
+            rand_ind = torch.randperm(ws.shape[0])
+            ws_aligned[:, :pose_layers] = ws[rand_ind, :pose_layers].lerp(ws[:, :pose_layers], 0)
+
+            #ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], 0)
             #ws_align_dir = torch.nn.functional.normalize(torch.randn(ws_aligned[:, :pose_layers].shape, device=device)) * pose_trunc_dist * 10
             #ws_align_dir = torch.sign((ws_align_dir * (ws[:, :pose_layers] - w_avg)).sum(dim=-1, keepdim=True)) * ws_align_dir 
             #ws_aligned[:, :pose_layers] = ws[:, :pose_layers] + ws_align_dir
@@ -802,7 +805,10 @@ def training_loop_tl(
                     ws[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], pose_trunc_dist)
 
                 ws_aligned = ws.clone()
-                ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], psi)
+                rand_ind = torch.randperm(ws.shape[0])
+                ws_aligned[:, :pose_layers] = ws[rand_ind, :pose_layers].lerp(ws[:, :pose_layers], psi)
+
+                #ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], psi)
                 #ws_align_dir = torch.nn.functional.normalize(torch.randn(ws_aligned[:, :pose_layers].shape, device=device)) * pose_trunc_dist * (1-psi) * 1 * 10
                 #ws_align_dir = torch.sign((ws_align_dir * (ws[:, :pose_layers] - w_avg)).sum(dim=-1, keepdim=True)) * ws_align_dir 
                 #ws_aligned[:, :pose_layers] = ws[:, :pose_layers] + ws_align_dir
