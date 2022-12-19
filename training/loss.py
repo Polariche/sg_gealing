@@ -59,10 +59,15 @@ class TransformerSiameseLoss(Loss):
             ws = G.mapping(z, c, update_emas=update_emas)
             ws[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], self.pose_trunc_dist)
 
+        """
         ws_aligned = ws.clone()
         ws_align_dir = torch.nn.functional.normalize(torch.randn(ws_aligned[:, :self.pose_layers].shape, device=self.device)) * self.pose_trunc_dist * (1-psi)  * 10
         ws_align_dir = torch.sign((ws_align_dir * (ws[:, :self.pose_layers] - w_avg)).sum(dim=-1, keepdim=True)) * ws_align_dir 
         ws_aligned[:, :self.pose_layers] = ws[:, :self.pose_layers] + ws_align_dir
+        """
+
+        ws_aligned = ws.clone()
+        ws_aligned[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], psi)
 
         ws_input = torch.cat([ws, ws_aligned])
 
@@ -76,7 +81,7 @@ class TransformerSiameseLoss(Loss):
         #if self.augment_pipe is not None:
         #    img = self.augment_pipe(img)
 
-        img2_new, img1_new = self.T.siamese_forward(img1, img2, blur_sigma=blur_sigma, update_emas=update_emas)
+        img1_new, img2_new = self.T.siamese_forward(img1, img2, blur_sigma=blur_sigma, update_emas=update_emas)
         return img1_new, img2_new
         
 
@@ -95,7 +100,7 @@ class TransformerSiameseLoss(Loss):
         with torch.autograd.profiler.record_function('Gmain_forward'):
             img_1, ws_1, img_2, ws_2 = self.run_G(gen_z, gen_c, psi=psi)
 
-            transformed_1, transformed_2 = self.run_T(img_1.detach(), img_2.detach(), return_full=False, blur_sigma=blur_sigma)
+            transformed_1, transformed_2 = self.run_T(img_1.detach(), img_2.detach(), blur_sigma=blur_sigma)
             img = torch.cat([img_1, img_2, transformed_1, transformed_2], dim=0)
             
             lpips_t0, lpips_t1 = self.vgg(img, resize_images=False, return_lpips=True).chunk(2)

@@ -641,10 +641,10 @@ def training_loop_tl(
                 ws[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], pose_trunc_dist)
 
             ws_aligned = ws.clone()
-            #ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], 0)
-            ws_align_dir = torch.nn.functional.normalize(torch.randn(ws_aligned[:, :pose_layers].shape, device=device)) * pose_trunc_dist * 10
-            ws_align_dir = torch.sign((ws_align_dir * (ws[:, :pose_layers] - w_avg)).sum(dim=-1, keepdim=True)) * ws_align_dir 
-            ws_aligned[:, :pose_layers] = ws[:, :pose_layers] + ws_align_dir
+            ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], 0)
+            #ws_align_dir = torch.nn.functional.normalize(torch.randn(ws_aligned[:, :pose_layers].shape, device=device)) * pose_trunc_dist * 10
+            #ws_align_dir = torch.sign((ws_align_dir * (ws[:, :pose_layers] - w_avg)).sum(dim=-1, keepdim=True)) * ws_align_dir 
+            #ws_aligned[:, :pose_layers] = ws[:, :pose_layers] + ws_align_dir
 
 
             images = torch.cat([G_ema.synthesis(ws_[None]) for ws_ in ws])
@@ -802,20 +802,24 @@ def training_loop_tl(
                     ws[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], pose_trunc_dist)
 
                 ws_aligned = ws.clone()
-                #ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], psi)
-                ws_align_dir = torch.nn.functional.normalize(torch.randn(ws_aligned[:, :pose_layers].shape, device=device)) * pose_trunc_dist * (1-psi) * 1 * 10
-                ws_align_dir = torch.sign((ws_align_dir * (ws[:, :pose_layers] - w_avg)).sum(dim=-1, keepdim=True)) * ws_align_dir 
-                ws_aligned[:, :pose_layers] = ws[:, :pose_layers] + ws_align_dir
+                ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], psi)
+                #ws_align_dir = torch.nn.functional.normalize(torch.randn(ws_aligned[:, :pose_layers].shape, device=device)) * pose_trunc_dist * (1-psi) * 1 * 10
+                #ws_align_dir = torch.sign((ws_align_dir * (ws[:, :pose_layers] - w_avg)).sum(dim=-1, keepdim=True)) * ws_align_dir 
+                #ws_aligned[:, :pose_layers] = ws[:, :pose_layers] + ws_align_dir
 
                 images = torch.cat([G_ema.synthesis(ws_[None]) for ws_ in ws])
                 save_image_grid(images.cpu().numpy(), os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
 
-                images_transformed = T(images)
-                save_image_grid(images_transformed.cpu().numpy(), os.path.join(run_dir, f'fakes_transformed_{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
-
                 img_aligned = torch.cat([G_ema.synthesis(ws_aligned_[None]) for ws_aligned_ in ws_aligned])
                 save_image_grid(img_aligned.cpu().numpy(), os.path.join(run_dir, f'fakes_aligned_{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
-        
+
+                images_transformed, _ = T.siamese_forward(images, img_aligned)
+                save_image_grid(images_transformed.cpu().numpy(), os.path.join(run_dir, f'fakes_transformed_{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+
+                images_canon = T(images)
+                save_image_grid(images_canon.cpu().numpy(), os.path.join(run_dir, f'fakes_canon_{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+
+                        
         # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None

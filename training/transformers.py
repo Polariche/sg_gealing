@@ -431,7 +431,7 @@ class PerspectiveTransformer(Transformer):
         else:
             return out
 
-    def single_forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, depth=None, blur_sigma=0,  **kwargs):
+    def single_forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, render_mat=None, depth=None, blur_sigma=0,  **kwargs):
         if source_img == None: 
             source_img = input_img
 
@@ -444,8 +444,9 @@ class PerspectiveTransformer(Transformer):
         mat = self.join_prev_mat(mat, prev_mat)
 
         # canonical camera for rendering the canonical depth
-        default_cam_ = convert_square_mat(default_cam[None]).to(device)
-        render_mat = torch.linalg.inv(default_cam_)[..., :3, :4]
+        if render_mat == None:
+            default_cam_ = convert_square_mat(default_cam[None]).to(device)
+            render_mat = torch.linalg.inv(default_cam_)[..., :3, :4]
 
         out, depth = self.render_and_warp(input_img, mat, render_mat, source_img=source_img, depth=depth, padding_mode=padding_mode, blur_sigma=blur_sigma)
 
@@ -455,7 +456,12 @@ class PerspectiveTransformer(Transformer):
         else:
             return out
 
-    def siamese_forward(self, out_t, out_s, source_img, target_img, prev_mat_t=None, prev_mat_s=None, padding_mode='border', **kwargs):
+    def siamese_forward(self, out_t, out_s, source_img=None, target_img=None, return_full=False, prev_mat_t=None, prev_mat_s=None, padding_mode='border', **kwargs):
+        if source_img == None:
+            source_img = out_s
+        if target_img == None:
+            target_img = out_t
+
         out_pack = torch.cat([out_t, out_s], dim=0)
         params_pack = self.infer_params(out_pack)
         params_s, params_t = torch.chunk(params_pack, 2, dim=0)
@@ -466,10 +472,13 @@ class PerspectiveTransformer(Transformer):
         mat_t = create_affine_mat3D(*([torch.zeros_like(params_t[:, :1])]*4), *torch.split(params_t, 1, dim=1))
         mat_t = self.join_prev_mat(mat_t, prev_mat_t)
 
-        out_t_, _ = self.render_and_warp(out_t, mat_s, mat_t,  source_img=source_img, **kwargs)
-        out_s_, _ = self.render_and_warp(out_s, mat_t, mat_s,  source_img=target_img, **kwargs)
+        out_t_, depth_t = self.render_and_warp(out_t, mat_s, mat_t,  source_img=source_img, **kwargs)
+        out_s_, depth_s = self.render_and_warp(out_s, mat_t, mat_s,  source_img=target_img, **kwargs)
 
-        return out_t_, out_s_
+        if return_full:
+            return out_t_, out_s_, mat_t, mat_s, depth_t, depth_s
+        else:
+            return out_t_, out_s_
 
 
     def join_prev_mat(self, mat, prev_mat=None):
@@ -605,7 +614,7 @@ class SimilarityTransformer(Transformer):
         
         return mat
 
-    def single_forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, **kwargs):
+    def single_forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, render_mat=None, **kwargs):
         if source_img == None: 
             source_img = input_img
 
@@ -616,8 +625,13 @@ class SimilarityTransformer(Transformer):
         
         mat = create_affine_mat2D(*torch.split(params, 1, dim=1))
         mat = self.join_prev_mat(mat, prev_mat)
+
+        if render_mat == None:
+            render_mat = torch.eye(2,3).unsqueeze(0).to(device)
         
-        grid = F.affine_grid(mat, (N, C, H, W), align_corners=False).to(device)
+        inv_render_mat = torch.linalg.inv(convert_square_mat(render_mat))
+        
+        grid = F.affine_grid(mat @ inv_render_mat, (N, C, H, W), align_corners=False).to(device)
         out = self.warper(source_img, grid, padding_mode=padding_mode)
 
         if return_full:
@@ -627,7 +641,12 @@ class SimilarityTransformer(Transformer):
             return out
     
 
-    def siamese_forward(self, out_t, out_s, source_img, target_img, prev_mat_t=None, prev_mat_s=None, padding_mode='border', **kwargs):
+    def siamese_forward(self, out_t, out_s, source_img=None, target_img=None, return_full=False, prev_mat_t=None, prev_mat_s=None, padding_mode='border', **kwargs):
+        if source_img == None:
+            source_img = out_s
+        if target_img == None:
+            target_img = out_t
+
         N, C, H, W = source_img.shape
         device = out_t.device
 
@@ -650,7 +669,10 @@ class SimilarityTransformer(Transformer):
         out_t = self.warper(source_img, grid_st, padding_mode=padding_mode)
         out_s = self.warper(target_img, grid_ts, padding_mode=padding_mode)
 
-        return out_t, out_s
+        if return_full:
+            return out_t, out_s, mat_t, mat_s, None, None
+        else:
+            return out_t, out_s
 
 
 class TransformerSequence(nn.Module):
@@ -661,16 +683,19 @@ class TransformerSequence(nn.Module):
 
         
     
-    def forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, depth=None, use_initial_depth=False, **kwargs):
+    def forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, render_mat=None, depth=None, use_initial_depth=False, **kwargs):
         if source_img == None:
             source_img = input_img
 
         out = input_img
         kwargs['return_full'] = True
 
-        for transformer in self.transformers:
+        for transformer in self.transformers[:-1]:
             out, prev_mat, depth = transformer(out, source_img=source_img, prev_mat=prev_mat, depth=depth, **kwargs)
 
+        # apply render_mat in the last transformer
+        out, prev_mat, depth = self.transformers[-1](out, source_img=source_img, prev_mat=prev_mat, render_mat=render_mat, depth=depth, **kwargs)
+        
         if return_full:
             return out, prev_mat, depth
         else:
@@ -687,10 +712,10 @@ class TransformerSequence(nn.Module):
         out_s = source_img
         out_t = target_img
 
-        out_pack = torch.cat([out_s, out_t], dim=0)
+        out_pack = torch.cat([out_t, out_s], dim=0)
         prev_mat_pack = None
         depth_pack = None
-        source_img_pack = torch.cat([source_img, target_img], dim=0)
+        source_img_pack = torch.cat([target_img, source_img], dim=0)
 
         """
         align to the canonical until the last transformer module
@@ -699,13 +724,12 @@ class TransformerSequence(nn.Module):
         for transformer in self.transformers[:-1]:
             out_pack, prev_mat_pack, depth_pack = transformer(out_pack, source_img=source_img_pack, prev_mat=prev_mat_pack, depth=depth_pack, return_full=True)
 
-        last_transformer = self.transformers[-1]
-
-        out_s, out_t = torch.chunk(out_pack, 2, dim=0)
-        prev_mat_s, prev_mat_t = torch.chunk(prev_mat_pack, 2, dim=0)
+        out_t, out_s = torch.chunk(out_pack, 2, dim=0)
+        prev_mat_t, prev_mat_s = torch.chunk(prev_mat_pack, 2, dim=0)
         
 
-        return last_transformer.siamese_forward(out_t, out_s, source_img, target_img, prev_mat_t, prev_mat_s)
+        ret = self.transformers[-1].siamese_forward(out_t, out_s, source_img, target_img, return_full, prev_mat_t, prev_mat_s)
+        return ret
 
 
     def __getitem__(self, i):
