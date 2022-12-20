@@ -13,6 +13,7 @@ import torch
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import upfirdn2d
+from training.transformers import create_mat3D_from_6params, convert_square_mat
 
 import math
 
@@ -80,15 +81,15 @@ class TransformerSiameseLoss(Loss):
         img_set = G.synthesis(ws_input, update_emas=update_emas)
 
         img, img_aligned = img_set.chunk(2)
-        return img, ws, img_aligned, ws_aligned
+        return img, img_aligned,  ws, ws_aligned
 
 
     def run_T(self, img1, img2, blur_sigma=0, update_emas=False):
         #if self.augment_pipe is not None:
         #    img = self.augment_pipe(img)
 
-        img1_new, img2_new = self.T.siamese_forward(img1, img2, blur_sigma=blur_sigma, update_emas=update_emas)
-        return img1_new, img2_new
+        img1_new, img2_new, mat1, mat2, depth1, depth2 = self.T.siamese_forward(img1, img2, blur_sigma=blur_sigma, return_full=True, update_emas=update_emas)
+        return img1_new, img2_new, mat1, mat2, depth1, depth2
         
 
 
@@ -104,19 +105,35 @@ class TransformerSiameseLoss(Loss):
 
         # run G & T
         with torch.autograd.profiler.record_function('Gmain_forward'):
-            img_1, ws_1, img_2, ws_2 = self.run_G(gen_z, gen_c, psi=psi)
+            # run G to obtain a pair of images
+            # img_1 is the "original", and img_2 is a pose-swapped version
+            img_1,  img_2, ws_1, ws_2 = self.run_G(gen_z, gen_c, psi=psi)
 
-            transformed_1, transformed_2 = self.run_T(img_1.detach(), img_2.detach(), blur_sigma=blur_sigma)
+            # siamese transformation
+            transformed_1, transformed_2, mat_1, mat_2, _, _ = self.run_T(img_1.detach(), img_2.detach(), blur_sigma=blur_sigma)
             img = torch.cat([img_1, img_2, transformed_1, transformed_2], dim=0)
             
             lpips_t0, lpips_t1 = self.vgg(img, resize_images=False, return_lpips=True).chunk(2)
-            perceptual_loss= (lpips_t0 - lpips_t1).square().sum(1) / self.epsilon ** 2
+            perceptual_loss = (lpips_t0 - lpips_t1).square().sum(1) / self.epsilon ** 2
             training_stats.report('Loss/perceptual_loss', perceptual_loss)
 
-        with torch.autograd.profiler.record_function('Gmain_backward'):
-            perceptual_loss.mean().mul(gain).backward()
 
-            #pass
+            # draw random pose from a distribution
+            random_params = torch.randn((*img_1.shape[:-3], 6), device=self.device) * 1e-2
+            random_mat = create_mat3D_from_6params(random_params)
+
+            # render 
+            new_img = self.T(img_1.detach(), render_mat=random_mat, blur_sigma=blur_sigma)
+            _, random_mat_hat, _ = self.T(new_img, return_full=True, blur_sigma=blur_sigma)
+
+            mat_loss = (convert_square_mat(random_mat_hat) @ torch.linalg.inv(convert_square_mat(random_mat)) - torch.eye(4).unsqueeze(0).to(self.device)).square().sum(-1).sum(-1)
+            training_stats.report('Loss/mat_loss', mat_loss)
+
+            loss = perceptual_loss.mean() + mat_loss.mean() * 1e-1
+
+
+        with torch.autograd.profiler.record_function('Gmain_backward'):
+            loss.mul(gain).backward()
 
 #----------------------------------------------------------------------------
 
@@ -161,7 +178,7 @@ class TransformerLoss(Loss):
         img_set = G.synthesis(ws_input, update_emas=update_emas)
 
         img, img_aligned = img_set.chunk(2)
-        return img, ws, img_aligned, ws_aligned
+        return img, img_aligned,  ws, ws_aligned
 
 
     def run_T(self, img, blur_sigma=0, return_full=False, update_emas=False):
@@ -192,7 +209,7 @@ class TransformerLoss(Loss):
 
         # run G & T
         with torch.autograd.profiler.record_function('Gmain_forward'):
-            img, ws, img_aligned, ws_aligned = self.run_G(gen_z, gen_c, psi=psi)
+            img, img_aligned,  ws, ws_aligned = self.run_G(gen_z, gen_c, psi=psi)
 
             transformed_img = self.run_T(img.detach(), return_full=False, blur_sigma=blur_sigma)
             img = torch.cat([transformed_img, img_aligned], dim=0)

@@ -731,6 +731,5 @@ class TransformerSequence(nn.Module):
         ret = self.transformers[-1].siamese_forward(out_t, out_s, source_img, target_img, return_full, prev_mat_t, prev_mat_s)
         return ret
 
-
     def __getitem__(self, i):
         return self.transformers[i]

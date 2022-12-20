@@ -174,7 +174,7 @@ def generate_images(
 
         # transform
         blur_sigma = max(1 - 10000 / (1000 * 1e3), 0) * 2
-        img1_t, img2_t = T.siamese_forward(img1, img2, blur_sigma = blur_sigma, return_full=True, iters=1)
+        img1_t, img2_t = T.siamese_forward(img1, img2, blur_sigma = blur_sigma, return_full=False, iters=1)
         
         save_img(img1_t, f'{outdir}/batch{i:04d}_2.png')
         save_img(img2_t, f'{outdir}/batch{i:04d}_4.png')
