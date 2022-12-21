@@ -819,7 +819,7 @@ def training_loop_tl(
                 img_aligned = torch.cat([G_ema.synthesis(ws_aligned_[None]) for ws_aligned_ in ws_aligned])
                 save_image_grid(img_aligned.cpu().numpy(), os.path.join(run_dir, f'fakes_aligned_{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
 
-                images_transformed, _ = T.siamese_forward(images, img_aligned)
+                _, images_transformed = T.siamese_forward(images, img_aligned)
                 save_image_grid(images_transformed.cpu().numpy(), os.path.join(run_dir, f'fakes_transformed_{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
 
                 images_canon = T(images)

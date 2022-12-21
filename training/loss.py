@@ -119,8 +119,9 @@ class TransformerSiameseLoss(Loss):
 
 
             # draw random pose from a distribution
-            random_params = torch.randn((*img_1.shape[:-3], 6), device=self.device) * 1e-2
-            random_mat = create_mat3D_from_6params(random_params)
+            random_params = torch.randn((*img_1.shape[:-3], 6), device=self.device)
+            param_weights = torch.tensor([0.1, 0.05, 0.4, 0.4, 0.05, 0.05], device=self.device)
+            random_mat = create_mat3D_from_6params(random_params * param_weights)
 
             # render 
             new_img = self.T(img_1.detach(), render_mat=random_mat, blur_sigma=blur_sigma)
