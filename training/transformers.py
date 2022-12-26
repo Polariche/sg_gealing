@@ -443,12 +443,7 @@ class PerspectiveTransformer(Transformer):
         mat = create_affine_mat3D(*([torch.zeros_like(params[:, :1])]*4), *torch.split(params, 1, dim=1)) 
         mat = self.join_prev_mat(mat, prev_mat)
 
-        # canonical camera for rendering the canonical depth
-        if render_mat == None:
-            default_cam_ = convert_square_mat(default_cam[None]).to(device)
-            render_mat = torch.linalg.inv(default_cam_)[..., :3, :4]
-
-        out, depth = self.render_and_warp(input_img, mat, render_mat, source_img=source_img, depth=depth, padding_mode=padding_mode, blur_sigma=blur_sigma)
+        out, depth = self.render_and_warp(input_img, mat, None, source_img=source_img, depth=depth, padding_mode=padding_mode, blur_sigma=blur_sigma)
 
         if return_full:
             return out, mat, depth
@@ -498,12 +493,17 @@ class PerspectiveTransformer(Transformer):
 
         return mat
 
-    def render_and_warp(self, input_img, mat, render_mat, source_img=None, depth=None, padding_mode='border', blur_sigma=0):
+    def render_and_warp(self, input_img, mat, render_mat=None, source_img=None, depth=None, padding_mode='border', blur_sigma=0):
         if source_img == None: 
             source_img = input_img
 
         N, C, H, W = source_img.shape 
         device = input_img.device
+
+        # canonical camera for rendering the canonical depth
+        if render_mat == None:
+            default_cam_ = convert_square_mat(default_cam[None]).to(device)
+            render_mat = torch.linalg.inv(default_cam_)[..., :3, :4]
 
         # --------------- prepare canonical depth ------------------------------------------
 

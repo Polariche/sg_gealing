@@ -71,17 +71,19 @@ class TransformerSiameseLoss(Loss):
         ws_aligned[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], psi)
         """
 
-        ws_aligned = ws.clone()
+        ws_posed = ws.clone()
         rand_ind = torch.randperm(ws.shape[0])
-        ws_aligned[:, :self.pose_layers] = ws[rand_ind, :self.pose_layers].lerp(ws[:, :self.pose_layers], psi)
+        ws_posed[:, :self.pose_layers] = ws[rand_ind, :self.pose_layers].lerp(ws[:, :self.pose_layers], psi)
 
+        ws_aligned = ws.clone()
+        ws_aligned[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], 0)
 
-        ws_input = torch.cat([ws, ws_aligned])
+        ws_input = torch.cat([ws, ws_posed, ws_aligned])
 
         img_set = G.synthesis(ws_input, update_emas=update_emas)
 
-        img, img_aligned = img_set.chunk(2)
-        return img, img_aligned,  ws, ws_aligned
+        img, img_posed, img_aligned = img_set.chunk(3)
+        return img, img_posed, img_aligned,  ws, ws_posed, ws_aligned
 
 
     def run_T(self, img1, img2, blur_sigma=0, update_emas=False):
@@ -107,11 +109,13 @@ class TransformerSiameseLoss(Loss):
         with torch.autograd.profiler.record_function('Gmain_forward'):
             # run G to obtain a pair of images
             # img_1 is the "original", and img_2 is a pose-swapped version
-            img_1,  img_2, ws_1, ws_2 = self.run_G(gen_z, gen_c, psi=psi)
+            img_1,  img_2, img_aligned, ws_1, ws_2, ws_aligned = self.run_G(gen_z, gen_c, psi=psi)
 
             # siamese transformation
             transformed_1, transformed_2, mat_1, mat_2, _, _ = self.run_T(img_1.detach(), img_2.detach(), blur_sigma=blur_sigma)
-            img = torch.cat([img_1, img_2, transformed_1, transformed_2], dim=0)
+            transformed_to_aligned, _ = self.T[1].render_and_warp(img_1.detach(), mat_1, None)
+            img = torch.cat([img_1, img_2, img_aligned, 
+                            transformed_1, transformed_2, transformed_to_aligned], dim=0)
             
             lpips_t0, lpips_t1 = self.vgg(img, resize_images=False, return_lpips=True).chunk(2)
             perceptual_loss = (lpips_t0 - lpips_t1).square().sum(1) / self.epsilon ** 2

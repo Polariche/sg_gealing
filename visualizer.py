@@ -327,6 +327,9 @@ def main(
             '/mounted_data/experiments/00181-stylegan2-lsun_cat-gpus8-batch32/network-snapshot-002304.pkl',
             '/mounted_data/experiments/00181-stylegan2-lsun_cat-gpus8-batch32/network-snapshot-002816.pkl',
             '/mounted_data/experiments/00189-stylegan2-lsun_cat-gpus8-batch32/network-snapshot-002816.pkl',
+            '/mounted_data/experiments/00209-stylegan2-lsun_cat-gpus8-batch32/network-snapshot-001536.pkl',
+            '/mounted_data/experiments/00001-stylegan2-lsun_cat-gpus8-batch32/network-snapshot-000640.pkl',
+            '/mounted_data/experiments/00189-stylegan2-lsun_cat-gpus8-batch32/network-snapshot-000256.pkl',
         ]
 
         # Populate recent pickles list with pretrained model URLs.
