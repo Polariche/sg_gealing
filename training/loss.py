@@ -73,7 +73,7 @@ class TransformerSiameseLoss(Loss):
 
         ws_posed = ws.clone()
         rand_ind = torch.randperm(ws.shape[0])
-        ws_posed[:, :self.pose_layers] = ws[rand_ind, :self.pose_layers].lerp(ws[:, :self.pose_layers], psi)
+        ws_posed[:, :self.pose_layers] = ws[rand_ind, :self.pose_layers].lerp(ws[:, :self.pose_layers], psi.unsqueeze(1))
 
         ws_aligned = ws.clone()
         ws_aligned[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], 0)
@@ -100,8 +100,10 @@ class TransformerSiameseLoss(Loss):
         blur_sigma = max(1 - cur_nimg / (self.blur_fade_kimg * 1e3), 0) * self.blur_init_sigma if self.blur_fade_kimg > 0 else 0
         
         # cosine anneal, from gangealing.utils.annealing.cosine_anneal
-        psi = 0.5 * (1 + torch.cos(torch.tensor(math.pi * min(cur_nimg//1000, self.psi_anneal) / self.psi_anneal)))
-        psi = psi.to(self.device)
+        #psi = 0.5 * (1 + torch.cos(torch.tensor(math.pi * min(cur_nimg//1000, self.psi_anneal) / self.psi_anneal))).to(self.device)
+
+        # random psi
+        psi = torch.rand((gen_z.shape[0], 1)).to(self.device)
 
         training_stats.report('Loss/psi', psi)
 
