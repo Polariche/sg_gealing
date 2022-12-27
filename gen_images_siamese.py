@@ -158,11 +158,11 @@ def generate_images(
             G.synthesis.input.transform.copy_(torch.from_numpy(m))
 
         # generate the original image
-        #img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
+        img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
         
-        ws = G.mapping(z, label)
-        ws[:, :5] = w_avg + torch.nn.functional.normalize(ws[:, :5] - w_avg, dim=-1) * 1 * 10 * truncation_psi
-        img = G.synthesis(ws)
+        #ws = G.mapping(z, label)
+        #ws[:, :5] = w_avg + torch.nn.functional.normalize(ws[:, :5] - w_avg, dim=-1) * 1 * 10 * truncation_psi
+        #img = G.synthesis(ws)
         imgs.append(img.squeeze(0))
     
     imgs = torch.stack(imgs, dim=0)
