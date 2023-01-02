@@ -123,20 +123,7 @@ class TransformerSiameseLoss(Loss):
             perceptual_loss = (lpips_t0 - lpips_t1).square().sum(1) / self.epsilon ** 2
             training_stats.report('Loss/perceptual_loss', perceptual_loss)
 
-
-            # draw random pose from a distribution
-            random_params = torch.randn((*img_1.shape[:-3], 6), device=self.device)
-            param_weights = torch.tensor([0.1, 0.05, 0.4, 0.4, 0.05, 0.05], device=self.device)
-            random_mat = create_mat3D_from_6params(random_params * param_weights)
-
-            # render 
-            new_img = self.T(img_1.detach(), render_mat=random_mat, blur_sigma=blur_sigma)
-            _, random_mat_hat, _ = self.T(new_img, return_full=True, blur_sigma=blur_sigma)
-
-            mat_loss = (convert_square_mat(random_mat_hat) @ torch.linalg.inv(convert_square_mat(random_mat)) - torch.eye(4).unsqueeze(0).to(self.device)).square().sum(-1).sum(-1)
-            training_stats.report('Loss/mat_loss', mat_loss)
-
-            loss = perceptual_loss.mean() + mat_loss.mean() * 1e-1
+            loss = perceptual_loss.mean() 
 
 
         with torch.autograd.profiler.record_function('Gmain_backward'):

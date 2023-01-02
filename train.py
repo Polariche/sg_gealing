@@ -211,7 +211,7 @@ def main(**kwargs):
     c.batch_size = opts.batch
     c.batch_gpu = opts.batch_gpu or opts.batch // opts.gpus
 
-    c.pose_trunc_dist = 0.5
+    c.pose_trunc_dist = 1.0
     c.fix_w_dist = True
     c.pose_layers = 5
 

@@ -797,9 +797,11 @@ def training_loop_tl(
             with torch.no_grad():
                 psi_anneal = loss_kwargs.psi_anneal
                 #psi = 0.5 * (1 + torch.cos(torch.tensor(math.pi * min(cur_nimg//1000, psi_anneal)  / psi_anneal))).to(device)
-                psi = torch.rand((gen_z.shape[0], 1)).to(device)
+                
 
                 ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
+                psi = torch.rand((ws.shape[0], 1)).to(device)
+
                 if fix_w_dist:
                     ws[:, :pose_layers] = w_avg + torch.nn.functional.normalize(ws[:, :pose_layers] - w_avg, dim=-1) * 10 * pose_trunc_dist
                 else:
