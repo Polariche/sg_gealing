@@ -13,7 +13,7 @@ import torch
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import upfirdn2d
-from training.transformers import create_mat3D_from_6params, convert_square_mat
+from training.transformers import create_mat3D_from_6params, convert_square_mat, blur_with_kernel
 
 import math
 
@@ -118,6 +118,9 @@ class TransformerSiameseLoss(Loss):
             transformed_to_aligned, _ = self.T[1].render_and_warp(img_1.detach(), mat_1, None)
             img = torch.cat([img_1, img_2, img_aligned, 
                             transformed_1, transformed_2, transformed_to_aligned], dim=0)
+
+            # as per BARF, blur the imgs prior to consistency loss
+            img = blur_with_kernel(img, blur_sigma)
             
             lpips_t0, lpips_t1 = self.vgg(img, resize_images=False, return_lpips=True).chunk(2)
             perceptual_loss = (lpips_t0 - lpips_t1).square().sum(1) / self.epsilon ** 2

@@ -131,6 +131,25 @@ def create_mat3D_from_6params(params):
 
     return mat_label
 
+def blur_with_kernel(img, blur_sigma):
+    blur_size = np.floor(blur_sigma * 3)
+    if blur_size > 0:
+        with torch.autograd.profiler.record_function('blur'):
+            """
+            without reflection padding, spatial inductive bias is introduced to depth image around the border 
+            (see Positional Encoding as Spatial Inductive Bias in GANs for the effect of zero-padding)
+            """
+            original_size = img.shape[2:]
+            blur_size_int = int(blur_size)
+            img = F.pad(img, (blur_size_int,blur_size_int,blur_size_int,blur_size_int), "reflect")
+
+            f = torch.arange(-blur_size, blur_size + 1, device=img.device).div(blur_sigma).square().neg().exp2()
+            img = upfirdn2d.filter2d(img, f / f.sum())
+
+            img = center_crop(img, original_size)
+
+    return img
+
 class OSGDecoder(torch.nn.Module):
     def __init__(self, n_features, options):
         super().__init__()
@@ -530,21 +549,7 @@ class PerspectiveTransformer(Transformer):
             # TODO: design sigma progression graph
             depth = depth.permute(0,3,1,2)
 
-            blur_size = np.floor(blur_sigma * 3)
-            if blur_size > 0:
-                with torch.autograd.profiler.record_function('blur'):
-                    """
-                    without reflection padding, spatial inductive bias is introduced to depth image around the border 
-                    (see Positional Encoding as Spatial Inductive Bias in GANs for the effect of zero-padding)
-                    """
-                    original_size = depth.shape[2:]
-                    blur_size_int = int(blur_size)
-                    depth = F.pad(depth, (blur_size_int,blur_size_int,blur_size_int,blur_size_int), "reflect")
-
-                    f = torch.arange(-blur_size, blur_size + 1, device=depth.device).div(blur_sigma).square().neg().exp2()
-                    depth = upfirdn2d.filter2d(depth, f / f.sum())
-
-                    depth = center_crop(depth, original_size)
+            depth = blur_with_kernel(depth, blur_sigma)            
 
             """
             RELATED WORK:
