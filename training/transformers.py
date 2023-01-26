@@ -12,7 +12,7 @@ import numpy as np
 from typing import List, Optional, Dict
 
 from training.networks_stylegan2 import FullyConnectedLayer, Conv2dLayer
-from training.networks_stylegan2 import DiscriminatorBlock as ResBlock, DiscriminatorEpilogue as ResEpilogue
+from training.networks_stylegan2 import DiscriminatorBlock as ResBlock, DiscriminatorEpilogue as ResEpilogue, SynthesisBlock as ResUpBlock
 from training.antialiased_sampling import MipmapWarp, Warp
 from training.volumetric_rendering.renderer import ImportanceRenderer
 from torch_utils.ops import upfirdn2d
@@ -186,14 +186,21 @@ class TriplaneBlock(nn.Module):
         self.resizer = Resize(input_size)
 
         # nvidia
-        self.convs = nn.ModuleList([
-                            Conv2dLayer(3, 128, kernel_size=1),
-                            #ResBlock(128, 128, input_size, 3, up=1),
-                            ResBlock(128, 128, 256, input_size, 3, 1),
-                            #ResBlock(256, 256, input_size //2, 3, up=1),
-                            Conv2dLayer(256, 3 * self.plane_features, kernel_size=1),
-                            
+        self.convs_down = nn.ModuleList([
+                            Conv2dLayer(3, 32, kernel_size=1),
+                            ResBlock(32, 32, 64, input_size, 3, 1),
+                            ResBlock(64, 64, 128, input_size //2, 3, 1),
+                            ResBlock(128, 128, 256, input_size //4, 3, 1),
                         ])
+
+        self.epilogue = ResEpilogue(256, 512, input_size //8, 3, sum_cmap=False)
+
+        self.convs_up = nn.ModuleList([
+            ResUpBlock(256, 512, 512, input_size //4, 3 * self.plane_features, False, 'resnet'),
+            ResUpBlock(512, 256, 512, input_size //2, 3 * self.plane_features, False, 'resnet'),
+            ResUpBlock(256, 128, 512, input_size, 3 * self.plane_features, True, 'resnet'),
+        ])
+
         """
         IDEA: formulate encoder as...
         (fixed GAN layers; ~5 layers) + (the rest of GAN layer)
@@ -225,13 +232,25 @@ class TriplaneBlock(nn.Module):
         input_img = self.resizer(input_img)
         img = input_img
 
+        """
         out = self.convs[0](input_img)
         for c in self.convs[1:-1]:
             out, img = c(out, img)
         out = self.convs[-1](out)
+        """
+        out = self.convs_down[0](input_img)
+        for c in self.convs_down[1:]:
+            out, img = c(out, img)
 
+        cmap = torch.ones((input_img.shape[0], 512), device=input_img.device)
+        w = self.epilogue(out, img, cmap)
 
-        return out
+        img = None
+        for c in self.convs_up:
+            ws = w.unsqueeze(1).repeat(1, c.num_conv + c.num_torgb , 1)
+            out, img = c(out, img, ws)
+
+        return img
 
     def render(self, planes, resolution, mat):
         # mat: world -> cam
