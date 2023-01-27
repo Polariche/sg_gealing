@@ -187,18 +187,20 @@ class TriplaneBlock(nn.Module):
 
         # nvidia
         self.convs_down = nn.ModuleList([
-                            Conv2dLayer(3, 32, kernel_size=1),
-                            ResBlock(32, 32, 64, input_size, 3, 1),
-                            ResBlock(64, 64, 128, input_size //2, 3, 1),
+                            Conv2dLayer(3, 128, kernel_size=1),
+                            ResBlock(128, 128, 128, input_size, 3, 1),
+                            ResBlock(128, 128, 128, input_size //2, 3, 1),
                             ResBlock(128, 128, 256, input_size //4, 3, 1),
+                            ResBlock(256, 256, 512, input_size //8, 3, 1),
                         ])
 
-        self.epilogue = ResEpilogue(256, 512, input_size //8, 3, sum_cmap=False)
+        self.epilogue = ResEpilogue(512, 512, input_size //16, 3, sum_cmap=False)
 
         self.convs_up = nn.ModuleList([
-            ResUpBlock(256, 512, 512, input_size //4, 3 * self.plane_features, False, 'resnet'),
-            ResUpBlock(512, 256, 512, input_size //2, 3 * self.plane_features, False, 'resnet'),
-            ResUpBlock(256, 128, 512, input_size, 3 * self.plane_features, True, 'resnet'),
+            ResUpBlock(512, 256, 512, input_size //8, 3 * self.plane_features, False, 'resnet'),
+            ResUpBlock(256, 128, 512, input_size //4, 3 * self.plane_features, False, 'resnet'),
+            ResUpBlock(128, 128, 512, input_size //2, 3 * self.plane_features, False, 'resnet'),
+            ResUpBlock(128, 128, 512, input_size, 3 * self.plane_features, True, 'resnet'),
         ])
 
         """
