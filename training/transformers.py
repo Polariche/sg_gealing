@@ -507,8 +507,11 @@ class PerspectiveTransformer(Transformer):
         mat_t = create_affine_mat3D(*([torch.zeros_like(params_t[:, :1])]*4), *torch.split(params_t, 1, dim=1))
         mat_t = self.join_prev_mat(mat_t, prev_mat_t)
 
-        out_t_, depth_t = self.render_and_warp(out_t, mat_s, mat_t,  source_img=source_img, **kwargs)
-        out_s_, depth_s = self.render_and_warp(out_s, mat_t, mat_s,  source_img=target_img, **kwargs)
+
+        out_triplane = out_t if np.random.randn(1) > 0 else out_s
+
+        out_t_, depth_t = self.render_and_warp(out_triplane, mat_s, mat_t,  source_img=source_img, **kwargs)
+        out_s_, depth_s = self.render_and_warp(out_triplane, mat_t, mat_s,  source_img=target_img, **kwargs)
 
         if return_full:
             return out_t_, out_s_, mat_t, mat_s, depth_t, depth_s
