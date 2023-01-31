@@ -17,6 +17,7 @@ import matplotlib.cm
 import dnnlib
 from torch_utils.ops import upfirdn2d
 import legacy # pylint: disable=import-error
+import torch.nn.functional as F
 
 #----------------------------------------------------------------------------
 
@@ -116,6 +117,22 @@ def _apply_affine_transformation(x, mat, up=4, **filter_kwargs):
 
 #----------------------------------------------------------------------------
 
+# Spherical interpolation of a batch of vectors.
+def slerp(a, b, t):
+    a = a / a.norm(dim=-1, keepdim=True)
+    b = b / b.norm(dim=-1, keepdim=True)
+    d = (a * b).sum(dim=-1, keepdim=True)
+    p = t * torch.acos(d)
+    c = b - d * a
+    c = c / c.norm(dim=-1, keepdim=True)
+    d = a * torch.cos(p) + c * torch.sin(p)
+    d = d / d.norm(dim=-1, keepdim=True)
+    return d
+
+
+
+#----------------------------------------------------------------------------
+
 class Renderer:
     def __init__(self):
         self._device        = torch.device('cuda')
@@ -127,6 +144,8 @@ class Renderer:
         self._start_event   = torch.cuda.Event(enable_timing=True)
         self._end_event     = torch.cuda.Event(enable_timing=True)
         self._net_layers    = dict()    # {cache_key: [dnnlib.EasyDict, ...], ...}
+        
+        self._previous_image = None
 
     def render(self, **args):
         self._is_timing = True
@@ -251,7 +270,7 @@ class Renderer:
         res.has_input_transform = (hasattr(G.synthesis, 'input') and hasattr(G.synthesis.input, 'transform'))
 
         try:
-            T = self.get_network(pkl, 'T_ema')
+            T = self.get_network(pkl, 'T')
             has_T = True
         except:
             has_T = False
@@ -296,9 +315,6 @@ class Renderer:
                 super().__init__()
                 self.ms = torch.nn.ModuleList(modules)
 
-                #self.ms[1][0].fixed_params = torch.tensor([[0.0, 0.0, 0, 0]]).to("cuda")
-                #self.ms[1][1].fixed_params = torch.tensor([[0.1, 0.1]]).to("cuda")
-
             def forward(self, x, **kwargs):
                 out1 = self.ms[0](x, **kwargs)
                 out2 = self.ms[1](out1)
@@ -340,13 +356,45 @@ class Renderer:
             out.norm(float('inf')), sel.norm(float('inf')),
         ])
 
-        # Scale and convert to uint8.
         img = sel
+
+        diff_img = None
+        if self._previous_image != None:
+            p_img = self._previous_image
+
+            x_diff_mat = torch.eye(2,3).to(self._device)
+            x_diff_mat[0, 2] = -0.005
+            y_diff_mat = torch.eye(2,3).to(self._device)
+            y_diff_mat[1, 2] = -0.005
+
+            C, H, W = img.shape
+            x_img = F.grid_sample(img.unsqueeze(0), F.affine_grid(x_diff_mat.unsqueeze(0), (1,C,H,W)), padding_mode='border').squeeze(0)
+            y_img = F.grid_sample(img.unsqueeze(0), F.affine_grid(y_diff_mat.unsqueeze(0), (1,C,H,W)), padding_mode='border').squeeze(0)
+
+            if p_img.shape == img.shape:
+                w_diff_img = img - p_img
+                x_diff_img = img - x_img #img_gray - x_img_gray
+                y_diff_img = img - y_img #img_gray - y_img_gray
+
+                diff_img = torch.cat([(w_diff_img * x_diff_img).sum(dim=0, keepdim=True), 
+                                      (w_diff_img * y_diff_img).sum(dim=0, keepdim=True)], dim=0)
+                diff_img = torch.cat([diff_img, torch.zeros_like(w_diff_img)], dim=0)
+                
+        self._previous_image = img
+
+
+        #if diff_img != None:
+        #    img = diff_img[base_channel : base_channel + sel_channels]
+
+        # Scale and convert to uint8.
+        #img = sel
         if img_normalize:
             img = img / img.norm(float('inf'), dim=[1,2], keepdim=True).clip(1e-8, 1e8)
         img = img * (10 ** (img_scale_db / 20))
         img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8).permute(1, 2, 0)
+
         res.image = img
+    
 
         # FFT.
         if fft_show:
@@ -375,7 +423,6 @@ class Renderer:
                     out = out.mean(2)
                 if out.ndim == 3:
                     out = out.unsqueeze(1)
-                if out.ndim == 4 and out.shape[1] > out.shape[-1]:
                     out = out.permute(0,3,1,2)
                 name = submodule_names[module]
                 if name == '':
