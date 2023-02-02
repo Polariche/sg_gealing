@@ -186,28 +186,18 @@ class TriplaneBlock(nn.Module):
         self.resizer = Resize(input_size)
 
         # nvidia
-        self.convs_down = nn.ModuleList([
+        self.convs = nn.ModuleList([
                             Conv2dLayer(3, 128, kernel_size=1),
-                            ResBlock(128, 128, 128, input_size, 3, 1),
-                            ResBlock(128, 128, 128, input_size //2, 3, 1),
-                            ResBlock(128, 128, 256, input_size //4, 3, 1),
-                            ResBlock(256, 256, 512, input_size //8, 3, 1),
+                            #ResBlock(128, 128, input_size, 3, up=1),
+                            ResBlock(128, 128, 256, input_size, 3, 1),
+                            #ResBlock(256, 256, input_size //2, 3, up=1),
+                            Conv2dLayer(256, 3 * self.plane_features, kernel_size=1),
+                            
                         ])
-
-        self.epilogue = ResEpilogue(512, 512, input_size //16, 3, sum_cmap=False)
-
-        self.convs_up = nn.ModuleList([
-            ResUpBlock(512, 256, 512, input_size //8, 3 * self.plane_features, False, 'resnet'),
-            ResUpBlock(256, 128, 512, input_size //4, 3 * self.plane_features, False, 'resnet'),
-            ResUpBlock(128, 128, 512, input_size //2, 3 * self.plane_features, False, 'resnet'),
-            ResUpBlock(128, 128, 512, input_size, 3 * self.plane_features, True, 'resnet'),
-        ])
-
         """
         IDEA: formulate encoder as...
         (fixed GAN layers; ~5 layers) + (the rest of GAN layer)
                                            ^ stylization by latent code from img encdoer
-
         this way, we can inject a shape prior into the canonical volume space
         """
 
@@ -234,25 +224,13 @@ class TriplaneBlock(nn.Module):
         input_img = self.resizer(input_img)
         img = input_img
 
-        """
         out = self.convs[0](input_img)
         for c in self.convs[1:-1]:
             out, img = c(out, img)
         out = self.convs[-1](out)
-        """
-        out = self.convs_down[0](input_img)
-        for c in self.convs_down[1:]:
-            out, img = c(out, img)
 
-        cmap = torch.ones((input_img.shape[0], 512), device=input_img.device)
-        w = self.epilogue(out, img, cmap)
 
-        img = None
-        for c in self.convs_up:
-            ws = w.unsqueeze(1).repeat(1, c.num_conv + c.num_torgb , 1)
-            out, img = c(out, img, ws)
-
-        return img
+        return out
 
     def render(self, planes, resolution, mat):
         # mat: world -> cam
@@ -629,7 +607,40 @@ class PerspectiveTransformer(Transformer):
 
         return out, depth
 
-    
+
+    def transfer_points(self, out_t, out_s, points_t, points_s, source_img=None, target_img=None, 
+            prev_mat_t=None, prev_mat_s=None, padding_mode='border', **kwargs):
+
+        if source_img == None:
+            source_img = out_s
+        if target_img == None:
+            target_img = out_t
+
+        N, C, H, W = source_img.shape
+        device = out_t.device
+
+        out_pack = torch.cat([out_t, out_s], dim=0)
+        params_pack = self.infer_params(out_pack)
+        params_s, params_t = torch.chunk(params_pack, 2, dim=0)
+
+        mat_s = create_affine_mat3D(*([torch.zeros_like(params_s[:, :1])]*4), *torch.split(params_s, 1, dim=1))
+        mat_s = self.join_prev_mat(mat_s, prev_mat_s)
+
+        mat_t = create_affine_mat3D(*([torch.zeros_like(params_t[:, :1])]*4), *torch.split(params_t, 1, dim=1))
+        mat_t = self.join_prev_mat(mat_t, prev_mat_t)
+
+        uv = F.affine_grid(torch.eye(2,3).unsqueeze(0).repeat(N,1,1), (N, C, H, W), align_corners=False).permute(0,3,1,2).to(device)
+
+        # a mapping from t's coordinate -> s's uv cooridnate, using s's triplane
+        uv_s, _ = self.render_and_warp(out_s, mat_s, mat_t,  source_img=uv, **kwargs)
+        points_s_est = torch.nn.functional.grid_sample(uv_s, points_t[:, None]).squeeze(-2).permute(0,2,1)
+
+        # a mapping from s's coordinate -> t's uv cooridnate, using t's triplane
+        uv_t, _ = self.render_and_warp(out_t, mat_t, mat_s,  source_img=uv, **kwargs)
+        points_t_est = torch.nn.functional.grid_sample(uv_t, points_s[:, None]).squeeze(-2).permute(0,2,1)
+
+
+        return points_t_est, points_s_est
 
 
 
@@ -704,6 +715,32 @@ class SimilarityTransformer(Transformer):
             return out_t, out_s
 
 
+    def transfer_points(self, out_t, out_s, points_t, points_s, source_img=None, target_img=None, 
+            prev_mat_t=None, prev_mat_s=None, padding_mode='border', **kwargs):
+
+        if source_img == None:
+            source_img = out_s
+        if target_img == None:
+            target_img = out_t
+
+        N, C, H, W = source_img.shape
+        device = out_t.device
+
+        out_t, out_s, mat_t, mat_s, _, _ = self.siamese_forward(out_t, out_s, source_img, target_img, return_full=True, prev_mat_t=prev_mat_t, prev_mat_s=prev_mat_s, padding_mode=padding_mode, **kwargs)
+
+
+        inv_mat_t = torch.linalg.inv(convert_square_mat(mat_t))
+        inv_mat_s = torch.linalg.inv(convert_square_mat(mat_s))
+
+        points_t = torch.cat([points_t, torch.ones_like(points_t[..., :1])], dim=-1)
+        points_s = torch.cat([points_s, torch.ones_like(points_t[..., :1])], dim=-1)
+
+        points_s_est = ((mat_s @ inv_mat_t)[:, None] @ points_t.unsqueeze(-1)).squeeze(-1)
+        points_t_est = ((mat_t @ inv_mat_s)[:, None] @ points_s.unsqueeze(-1)).squeeze(-1)
+
+        return points_t_est, points_s_est
+
+
 class TransformerSequence(nn.Module):
     def __init__(self, width=256):
         super().__init__()
@@ -759,6 +796,38 @@ class TransformerSequence(nn.Module):
 
         ret = self.transformers[-1].siamese_forward(out_t, out_s, source_img, target_img, return_full, prev_mat_t, prev_mat_s)
         return ret
+
+    
+    def transfer_points(self, target_img, source_img, target_points, source_points, padding_mode='border', alpha=None, return_full=False, 
+                        use_initial_depth=False, **kwargs):
+
+        assert target_img.shape[0] == source_img.shape[0]
+        
+        kwargs['return_full'] = True
+
+        out_s = source_img
+        out_t = target_img
+
+        out_pack = torch.cat([out_t, out_s], dim=0)
+        prev_mat_pack = None
+        depth_pack = None
+        source_img_pack = torch.cat([target_img, source_img], dim=0)
+
+        """
+        align to the canonical until the last transformer module
+        in the last module, render with target img's matrix, and warp to the source img
+        """
+        for transformer in self.transformers[:-1]:
+            out_pack, prev_mat_pack, depth_pack = transformer(out_pack, source_img=source_img_pack, prev_mat=prev_mat_pack, depth=depth_pack, return_full=True)
+
+        out_t, out_s = torch.chunk(out_pack, 2, dim=0)
+        prev_mat_t, prev_mat_s = torch.chunk(prev_mat_pack, 2, dim=0)
+        
+
+        ret = self.transformers[-1].transfer_points(out_t, out_s, target_points, source_points, source_img, target_img, prev_mat_t, prev_mat_s)
+        return ret
+        
+
 
     def __getitem__(self, i):
         return self.transformers[i]
