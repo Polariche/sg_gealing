@@ -477,7 +477,7 @@ class PerspectiveTransformer(Transformer):
 
         out_pack = torch.cat([out_t, out_s], dim=0)
         params_pack = self.infer_params(out_pack)
-        params_s, params_t = torch.chunk(params_pack, 2, dim=0)
+        params_t, params_s = torch.chunk(params_pack, 2, dim=0)
 
         mat_s = create_affine_mat3D(*([torch.zeros_like(params_s[:, :1])]*4), *torch.split(params_s, 1, dim=1))
         mat_s = self.join_prev_mat(mat_s, prev_mat_s)
@@ -621,7 +621,7 @@ class PerspectiveTransformer(Transformer):
 
         out_pack = torch.cat([out_t, out_s], dim=0)
         params_pack = self.infer_params(out_pack)
-        params_s, params_t = torch.chunk(params_pack, 2, dim=0)
+        params_t, params_s = torch.chunk(params_pack, 2, dim=0)
 
         mat_s = create_affine_mat3D(*([torch.zeros_like(params_s[:, :1])]*4), *torch.split(params_s, 1, dim=1))
         mat_s = self.join_prev_mat(mat_s, prev_mat_s)
@@ -692,7 +692,7 @@ class SimilarityTransformer(Transformer):
 
         out_pack = torch.cat([out_t, out_s], dim=0)
         params_pack = self.infer_params(out_pack)
-        params_s, params_t = torch.chunk(params_pack, 2, dim=0)
+        params_t, params_s = torch.chunk(params_pack, 2, dim=0)
         
         mat_s = create_affine_mat2D(*torch.split(params_s, 1, dim=1))
         mat_s = self.join_prev_mat(mat_s, prev_mat_s)
