@@ -511,9 +511,6 @@ def training_loop_tl(
     T = TransformerSequence(**T_kwargs).train().requires_grad_(False).to(device)
     T_ema = copy.deepcopy(T).eval()
 
-    #L = DirectionInterpolator(pca_path=None, n_comps=1, inject_index=5, n_latent=14, num_heads=1).to(device)
-
-
     vgg16_url = './pretrained/vgg16.pkl' #'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/vgg16.pkl'
     vgg16 = metric_utils.get_feature_detector(vgg16_url, num_gpus=num_gpus, rank=rank,  verbose=True).requires_grad_(False).to(device)
 
@@ -525,9 +522,8 @@ def training_loop_tl(
         for name, module in [('G', G), ('G_ema', G_ema)]: #('D', D)
             misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
 
-
-    G_ema.mapping.register_buffer('w_dir', torch.zeros([G_ema.mapping.w_dim]).to(device))
-    G_ema.mapping.register_parameter('w_coeff', torch.nn.Parameter(torch.zeros([1]).to(device)))
+    # enable training for w_coeff
+    G_ema.mapping.w_coeff.requires_grad_(True)
 
     n_pca = 1000# if args.debug else 1000000
 

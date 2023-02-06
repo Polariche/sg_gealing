@@ -227,6 +227,8 @@ class MappingNetwork(torch.nn.Module):
 
         if num_ws is not None and w_avg_beta is not None:
             self.register_buffer('w_avg', torch.zeros([w_dim]))
+            self.register_buffer('w_dir', torch.zeros([w_dim]))
+            self.register_parameter('w_coeff', torch.nn.Parameter(torch.zeros([1])))
 
     def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False):
         # Embed, normalize, and concat inputs.

@@ -200,6 +200,8 @@ def convert_tf_generator(tf_G):
         r'synthesis\.b(\d+)\.skip\.weight',                 lambda r:   tf_params[f'synthesis/{r}x{r}/Skip/weight'][::-1, ::-1].transpose(3, 2, 0, 1),
         r'.*\.resample_filter',                             None,
         r'.*\.act_filter',                                  None,
+        r'mapping\.w_dir',                                  None,
+        r'mapping\.w_coeff',                                None,
     )
     return G
 
