@@ -298,6 +298,8 @@ def training_loop(
                         param.grad = grad.reshape(param.shape)
                 phase.opt.step()
 
+                # update coefficient
+
             # Phase done.
             if phase.end_event is not None:
                 phase.end_event.record(torch.cuda.current_stream(device))
@@ -523,7 +525,10 @@ def training_loop_tl(
         for name, module in [('G', G), ('G_ema', G_ema)]: #('D', D)
             misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
 
-    
+
+    G_ema.mapping.register_buffer('w_dir', torch.zeros([G_ema.mapping.w_dim]).to(device))
+    G_ema.mapping.register_parameter('w_coeff', torch.nn.Parameter(torch.zeros([1]).to(device)))
+
     n_pca = 1000# if args.debug else 1000000
 
     if rank != 0 and num_gpus > 1:
@@ -532,27 +537,18 @@ def training_loop_tl(
     if rank == 0 or num_gpus == 0:
         with torch.no_grad():
             # randomly sample z -> map to w
-            #batch_w = G_ema.batch_latent(n_pca // get_world_size())
-
             grid_z = torch.randn([n_pca, G_ema.z_dim], device=device).split(batch_gpu)
             grid_c = torch.zeros((n_pca, 0), device=device).split(batch_gpu)
             batch_w = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])[:, 0]
 
-            #batch_w = all_gather(batch_w)
             pca = PCA(1, batch_w)
 
             # TODO: make use of w-direction from pca
+            G_ema.mapping.w_dir = torch.from_numpy(pca.pca.components_.astype(np.float32)).squeeze(0).cuda()
 
-            #L.assign_buffers(pca)
 
     if rank == 0 and num_gpus > 1:
-            torch.distributed.barrier() # others follow
-
-    """
-    if num_gpus > 1:
-        for param in misc.params_and_buffers(L):
-            torch.distributed.broadcast(param, src=0)
-    """
+        torch.distributed.barrier() # others follow
 
     # Print network summary tables.
     if rank == 0:
@@ -595,15 +591,17 @@ def training_loop_tl(
 
     phases = []
     for name, module, opt_kwargs, reg_interval in [('T', T, T_opt_kwargs, None)]: #,[('G', G, G_opt_kwargs, G_reg_interval): ('D', D, D_opt_kwargs, D_reg_interval)]:
+        params = list(module.parameters()) + [G_ema.mapping.w_coeff]
+
         if reg_interval is None:
-            opt = dnnlib.util.construct_class_by_name(params=module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+            opt = dnnlib.util.construct_class_by_name(params=params, **opt_kwargs) # subclass of torch.optim.Optimizer
             phases += [dnnlib.EasyDict(name=name+'both', module=module, opt=opt, interval=1)]
         else: # Lazy regularization.
             mb_ratio = reg_interval / (reg_interval + 1)
             opt_kwargs = dnnlib.EasyDict(opt_kwargs)
             opt_kwargs.lr = opt_kwargs.lr * mb_ratio
             opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
-            opt = dnnlib.util.construct_class_by_name(module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
+            opt = dnnlib.util.construct_class_by_name(params=params, **opt_kwargs) # subclass of torch.optim.Optimizer
             phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1)]
             #phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval)]
     for phase in phases:
@@ -618,12 +616,10 @@ def training_loop_tl(
     grid_z = None
     grid_c = None
 
-    w_avg = G_ema.mapping.w_avg
+    w_avg = G_ema.mapping.w_avg + G_ema.mapping.w_coeff * G_ema.mapping.w_dir
 
     if rank == 0:
         print('Exporting sample images...')
-        #grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
-        #save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
 
         with torch.no_grad():
             grid_size = (7, 4)
@@ -635,20 +631,13 @@ def training_loop_tl(
             ws = torch.cat([G_ema.mapping(z=z, c=c) for z, c in zip(grid_z, grid_c)])
             if fix_w_dist:
                 ws[:, :pose_layers] = w_avg + torch.nn.functional.normalize(ws[:, :pose_layers] - w_avg, dim=-1) * 1 * 10 * pose_trunc_dist
-                #print(torch.linalg.norm(ws[:, :pose_layers] - w_avg, dim=-1))
-                #pass
+
             else:
                 ws[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], pose_trunc_dist)
 
             ws_aligned = ws.clone()
             rand_ind = torch.randperm(ws.shape[0])
             ws_aligned[:, :pose_layers] = ws[rand_ind, :pose_layers].lerp(ws[:, :pose_layers], 0)
-
-            #ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], 0)
-            #ws_align_dir = torch.nn.functional.normalize(torch.randn(ws_aligned[:, :pose_layers].shape, device=device)) * pose_trunc_dist * 10
-            #ws_align_dir = torch.sign((ws_align_dir * (ws[:, :pose_layers] - w_avg)).sum(dim=-1, keepdim=True)) * ws_align_dir 
-            #ws_aligned[:, :pose_layers] = ws[:, :pose_layers] + ws_align_dir
-
 
             images = torch.cat([G_ema.synthesis(ws_[None]) for ws_ in ws])
             save_image_grid(images.cpu().numpy(), os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
@@ -729,6 +718,9 @@ def training_loop_tl(
                     for param, grad in zip(params, grads):
                         param.grad = grad.reshape(param.shape)
                 phase.opt.step()
+
+                # update w_avg
+                w_avg = G_ema.mapping.w_avg + G_ema.mapping.w_coeff * G_ema.mapping.w_dir
             
             
             # Phase done.
