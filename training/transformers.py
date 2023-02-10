@@ -9,10 +9,12 @@ from torchvision.transforms.functional import gaussian_blur, center_crop
 import math 
 import numpy as np
 
+from torch.optim import Adam
+
 from typing import List, Optional, Dict
 
 from training.networks_stylegan2 import FullyConnectedLayer, Conv2dLayer
-from training.networks_stylegan2 import DiscriminatorBlock as ResBlock, DiscriminatorEpilogue as ResEpilogue, SynthesisBlock as ResUpBlock
+from training.networks_stylegan2 import DiscriminatorBlock as ResBlock, DiscriminatorEpilogue as ResEpilogue, SynthesisBlock as ResUpBlock, MinibatchStdLayer
 from training.antialiased_sampling import MipmapWarp, Warp
 from training.volumetric_rendering.renderer import ImportanceRenderer
 from torch_utils.ops import upfirdn2d
@@ -386,12 +388,8 @@ class Transformer(nn.Module):
 
         raise NotImplementedError()
 
-    def congeal_points(self, input_img, points, padding_mode='border', alpha=None, **kwargs):
-        # TODO
-
-        raise NotImplementedError()
-
-    def uncongeal_points(self, input_img, points, padding_mode='border', alpha=None, **kwargs):
+    def transfer_points(self, out_t, out_s, points_t, points_s, source_img=None, target_img=None, 
+            prev_mat_t=None, prev_mat_s=None, padding_mode='border', **kwargs):
         # TODO
 
         raise NotImplementedError()
@@ -726,8 +724,15 @@ class SimilarityTransformer(Transformer):
         N, C, H, W = source_img.shape
         device = out_t.device
 
-        out_t, out_s, mat_t, mat_s, _, _ = self.siamese_forward(out_t, out_s, source_img, target_img, return_full=True, prev_mat_t=prev_mat_t, prev_mat_s=prev_mat_s, padding_mode=padding_mode, **kwargs)
+        out_pack = torch.cat([out_t, out_s], dim=0)
+        params_pack = self.infer_params(out_pack)
+        params_t, params_s = torch.chunk(params_pack, 2, dim=0)
+        
+        mat_s = create_affine_mat2D(*torch.split(params_s, 1, dim=1))
+        mat_s = self.join_prev_mat(mat_s, prev_mat_s)
 
+        mat_t = create_affine_mat2D(*torch.split(params_t, 1, dim=1))
+        mat_t = self.join_prev_mat(mat_t, prev_mat_t)
 
         inv_mat_t = torch.linalg.inv(convert_square_mat(mat_t))
         inv_mat_s = torch.linalg.inv(convert_square_mat(mat_s))
@@ -741,11 +746,205 @@ class SimilarityTransformer(Transformer):
         return points_t_est, points_s_est
 
 
+class FlowTransformer(Transformer):
+    def __init__(self, input_size, channel_multiplier=0.5, num_heads=1, antialias=True, fixed_params=None, initialize_zero=True):
+        super().__init__(input_size, 2, channel_multiplier, num_heads, antialias, fixed_params)
+
+        in_channel = self.convs[3].conv1.weight.shape[0] #self.convs[3].conv1.weight.shape[0]
+        self.flow_downsample = 8
+
+        self.flow_out = nn.Sequential(MinibatchStdLayer(4, 1),
+                                      Conv2dLayer(in_channel+1, in_channel, kernel_size=3),
+                                      #nn.ReLU(),
+                                      Conv2dLayer(in_channel, 2, kernel_size=3))
+
+        self.mask_out = nn.Sequential(MinibatchStdLayer(4, 1),
+                                      Conv2dLayer(in_channel+1, in_channel, kernel_size=3),
+                                      #nn.ReLU(),
+                                      Conv2dLayer(in_channel, 9 * self.flow_downsample * self.flow_downsample, kernel_size=3))
+
+
+        nn.init.zeros_(self.flow_out[-1].weight)
+        nn.init.zeros_(self.flow_out[-1].bias)
+
+    def encode_features(self, input_img):
+        # get base feature map
+        N = input_img.shape[0]
+        DS = self.flow_downsample
+
+        img = input_img
+        out = self.convs[0](img)
+        for c in self.convs[1:4]:
+            out, img = c(out, img)
+
+        # compute_flow
+        flow = self.flow_out(out)
+
+        H, W = flow.shape[2:]
+
+        return flow.permute(0,2,3,1)
+
+        # upsample_flow
+        mask = self.mask_out(out)
+
+        assert H == mask.shape[2] and W == mask.shape[3]
+
+        mask = mask.view(N, 1, 9, DS, DS, H, W)
+        mask = torch.softmax(mask, dim=1)
+
+        up_flow = F.unfold(DS * flow, [3,3], padding=1)
+        up_flow = up_flow.view(N, 2, 9, 1, 1, H, W)
+
+        up_flow = torch.sum(mask * up_flow, dim=2)
+        up_flow = up_flow.permute(0, 4, 2, 5, 3, 1)
+        up_flow = up_flow.reshape(N, DS * H, DS*W, 2)
+
+        return up_flow
+
+    def reverse_flow(self, flow, shape):
+
+        N, _, H, W = shape
+        device = flow.device
+
+        flow = F.interpolate(flow.permute(0,3,1,2), scale_factor=H / flow.shape[2], mode='bilinear').permute(0,2,3,1)       # interpolate flow to match image size
+        grid = F.affine_grid(torch.eye(2,3).unsqueeze(0).repeat(N,1,1), (N, 2, H, W), align_corners=False).to(device)       # identity grid
+        
+        flow_grid = (grid + flow).clone().detach()
+
+        inverse_flow = grid.clone().detach().requires_grad_(True)
+        opt = Adam([inverse_flow], lr=1e-3)
+
+        for i in range(100):
+            opt.zero_grad()
+            composed_flow = F.grid_sample(flow_grid.permute(0,3,1,2), inverse_flow).permute(0,2,3,1)
+            loss = (composed_flow - grid).pow(2).sum(dim=-1).mean()
+            loss.requires_grad_(True)
+            
+            loss.backward()
+            opt.step()
+
+
+        return inverse_flow#.clone().detach()
+
+
+    def forward_flow(self, flow, shape):
+        N, _, H, W = shape
+        device = flow.device
+
+        flow = F.interpolate(flow.permute(0,3,1,2), scale_factor=H / flow.shape[2], mode='bilinear').permute(0,2,3,1)       # interpolate flow to match image size
+        grid = F.affine_grid(torch.eye(2,3).unsqueeze(0).repeat(N,1,1), (N, 2, H, W), align_corners=False).to(device)       # identity grid
+        grid = grid + flow                                                                                                  # apply delta flow to grid
+
+        return grid
+    
+    def render_and_warp(self, input_img, mat, render_mat=None, source_img=None, depth=None, padding_mode='border', blur_sigma=0):
+        if source_img == None: 
+            source_img = input_img
+
+        N, C, H, W = source_img.shape 
+        device = input_img.device
+
+        flow = self.infer_params(input_img)
+
+        if render_mat == None:
+            render_mat = torch.eye(2,3).unsqueeze(0).to(device)
+        inv_render_mat = torch.linalg.inv(convert_square_mat(render_mat))
+
+        grid = self.forward_flow(flow, source_img.shape)
+
+        grid = torch.cat([grid, torch.ones_like(grid[..., :1])], dim=-1)                                                    # homogeneous
+        grid = ((mat @ inv_render_mat)[:, None] @ (grid.view(N, H*W, 3, 1))).view(N, H, W, 2)                                 # apply affine
+
+        out = self.warper(source_img, grid, padding_mode=padding_mode)
+
+        return out, flow
+
+
+    def single_forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, render_mat=None, **kwargs):
+        device = input_img.device
+
+        if prev_mat == None:
+            prev_mat = torch.eye(2,3).unsqueeze(0).to(device)
+        mat = prev_mat
+
+        out,flow = self.render_and_warp(input_img, mat, render_mat=render_mat, source_img=source_img)
+
+
+        if return_full:
+            return out, mat, flow
+        
+        else:
+            return out
+    
+
+    def siamese_forward(self, out_t, out_s, source_img=None, target_img=None, return_full=False, prev_mat_t=None, prev_mat_s=None, padding_mode='border', **kwargs):
+        if source_img == None:
+            source_img = out_s
+        if target_img == None:
+            target_img = out_t
+
+        N, C, H, W = source_img.shape
+        device = out_t.device
+
+        # get flows
+        out_pack = torch.cat([out_t, out_s], dim=0)
+        params_pack = self.infer_params(out_pack)
+        flow_t, flow_s = torch.chunk(params_pack, 2, dim=0)
+
+        grid_t = self.forward_flow(flow_t, (N, C, H, W))
+        inv_grid_t = self.reverse_flow(flow_t, (N, C, H, W))
+
+        grid_s = self.forward_flow(flow_s, (N, C, H, W))
+        inv_grid_s =  self.reverse_flow(flow_t, (N, C, H, W))
+        
+        # setup matrices
+        if prev_mat_t == None:
+            mat_t = torch.eye(2,3).unsqueeze(0).to(device)
+        else:
+            mat_t = prev_mat_t
+
+        if prev_mat_s == None:
+            mat_s = torch.eye(2,3).unsqueeze(0).to(device)
+        else:
+            mat_s = prev_mat_s
+        
+        inv_mat_t = torch.linalg.inv(convert_square_mat(mat_t))
+        inv_mat_s = torch.linalg.inv(convert_square_mat(mat_s))
+
+        # get sampling grids for each view
+        # compose two flow grids
+        
+        comp_grid_st = F.grid_sample(grid_s.permute(0,3,1,2), inv_grid_t, padding_mode=padding_mode).permute(0,2,3,1)
+        comp_grid_st = torch.cat([comp_grid_st, torch.ones_like(comp_grid_st[..., :1])], dim=-1)                                           # homogeneous
+        comp_grid_st = ((mat_s @ inv_mat_t)[:, None] @ (comp_grid_st.view(N, H*W, 3, 1))).view(N, H, W, 2)                                 # apply affine
+
+        comp_grid_ts = F.grid_sample(grid_t.permute(0,3,1,2), inv_grid_s, padding_mode=padding_mode).permute(0,2,3,1)
+        comp_grid_ts = torch.cat([comp_grid_ts, torch.ones_like(comp_grid_ts[..., :1])], dim=-1)                                           # homogeneous
+        comp_grid_ts = ((mat_t @ inv_mat_s)[:, None] @ (comp_grid_ts.view(N, H*W, 3, 1))).view(N, H, W, 2)                                 # apply affine
+
+        out_t = self.warper(source_img, comp_grid_st, padding_mode=padding_mode)
+        out_s = self.warper(target_img, comp_grid_ts, padding_mode=padding_mode)
+
+        if return_full:
+            return out_t, out_s, mat_t, mat_s, None, None
+        else:
+            return out_t, out_s
+
+
+    def transfer_points(self, out_t, out_s, points_t, points_s, source_img=None, target_img=None, 
+            prev_mat_t=None, prev_mat_s=None, padding_mode='border', **kwargs):
+
+        raise NotImplementedError
+
+        #return points_t_est, points_s_est
+
+
 class TransformerSequence(nn.Module):
     def __init__(self, width=256):
         super().__init__()
         self.transformers = nn.ModuleList([SimilarityTransformer(width),
-                                            PerspectiveTransformer(width)])
+                                            #PerspectiveTransformer(width)])
+                                            FlowTransformer(width)])
 
         
     

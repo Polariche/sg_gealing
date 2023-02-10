@@ -114,10 +114,11 @@ class TransformerSiameseLoss(Loss):
             img_1,  img_2, img_aligned, ws_1, ws_2, ws_aligned = self.run_G(gen_z, gen_c, psi=psi)
 
             # siamese transformation
-            transformed_1, transformed_2, mat_1, mat_2, _, _ = self.run_T(img_1.detach(), img_2.detach(), blur_sigma=blur_sigma)
-            transformed_to_aligned, _ = self.T[1].render_and_warp(img_1.detach(), mat_1, None)
+            transformed_1, transformed_2, mat_1, mat_2, depth_1, depth_2 = self.run_T(img_1.detach(), img_2.detach(), blur_sigma=blur_sigma)
+            transformed_to_aligned, depth_aligned = self.T[1].render_and_warp(img_1.detach(), mat_1, None)
             img = torch.cat([img_1, img_2, img_aligned, 
-                            transformed_1, transformed_2, transformed_to_aligned], dim=0)
+                            transformed_1, transformed_2, transformed_to_aligned
+                            ], dim=0)
 
             # as per BARF, blur the imgs prior to consistency loss
             img = blur_with_kernel(img, blur_sigma)
@@ -126,7 +127,10 @@ class TransformerSiameseLoss(Loss):
             perceptual_loss = (lpips_t0 - lpips_t1).square().sum(1) / self.epsilon ** 2
             training_stats.report('Loss/perceptual_loss', perceptual_loss)
 
-            loss = perceptual_loss.mean() 
+            flow_identity_loss = depth_aligned.square().sum(3) # / self.epsilon ** 2
+            training_stats.report('Loss/flow_identity_loss', flow_identity_loss)
+
+            loss = perceptual_loss.mean()# + flow_identity_loss.mean()
 
 
         with torch.autograd.profiler.record_function('Gmain_backward'):

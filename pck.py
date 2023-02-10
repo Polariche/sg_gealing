@@ -79,12 +79,18 @@ def vis_transfer(t, loader, permutation, match_flows, out, num_to_vis=8, **stn_f
     imgsA, imgsB, gt_kpsA_original, gt_kpsB = d['imgsA'][:num_to_vis].to(device), d['imgsB'][:num_to_vis].to(device), \
                                               d['kpsA'][:num_to_vis, :, :2].to(device), d['kpsB'][:num_to_vis, :, :2].to(device)
     imgs = torch.cat([imgsA, imgsB]).cpu()  # Visualize the original images (before any flips are performed)
+    """
     if match_flows:
         imgsA, imgsB, gt_kpsA, gt_kpsB, indices = t.match_flows(imgsA, imgsB, gt_kpsA_original, gt_kpsB, permutation,
                                                                 **stn_forward_kwargs)
+    """
+
     # Transfer the key points from imgsA to imgsB:
-    est_kpsB = t.transfer_points(imgsA, imgsB, gt_kpsA, **stn_forward_kwargs)
-    est_kpsB[:, :, 0] = torch.where(indices.view(imgsA.size(0), 1) > 1, imgsB.size(-1) - 1 - est_kpsB[:, :, 0], est_kpsB[:, :, 0])
+    #est_kpsB = t.transfer_points(imgsA, imgsB, gt_kpsA, **stn_forward_kwargs)
+    gt_kpsA = torch.zeros_like(gt_kpsB)
+    _, est_kpsB = t.transfer_points(imgsA, imgsB, gt_kpsA, gt_kpsB, **stn_forward_kwargs)
+
+    #est_kpsB[:, :, 0] = torch.where(indices.view(imgsA.size(0), 1) > 1, imgsB.size(-1) - 1 - est_kpsB[:, :, 0], est_kpsB[:, :, 0])
     kps = torch.cat([gt_kpsA_original, est_kpsB]).cpu()
     out_path = f'{out}/transfers'
     ray.init()
@@ -140,8 +146,17 @@ def pck_transfer(t, loader, alpha=0.1, num_pairs=10000, device='cuda', quiet=Tru
         else:  # Assume all key points are visible:
             visible_kps = torch.ones(gt_kpsA.size(0), gt_kpsA.size(1), 1, device=device)
 
+        res = 256
+        out_res = 256
+        gt_kpsA = gt_kpsA.div(out_res - 1).add(-0.5).mul(2).mul((res - 1) / res)
+        gt_kpsB = gt_kpsB.div(out_res - 1).add(-0.5).mul(2).mul((res - 1) / res)
 
         est_kpsA, est_kpsB = t.transfer_points(imgsA, imgsB, gt_kpsA, gt_kpsB, **stn_forward_kwargs)
+
+        gt_kpsA = gt_kpsA.div((res - 1) / res).div(2).add(0.5).mul(out_res - 1)
+        gt_kpsB = gt_kpsB.div((res - 1) / res).div(2).add(0.5).mul(out_res - 1)
+        est_kpsA = est_kpsA.div((res - 1) / res).div(2).add(0.5).mul(out_res - 1)
+        est_kpsB = est_kpsB.div((res - 1) / res).div(2).add(0.5).mul(out_res - 1)
 
         if 'threshB' not in d:  # alpha threshold (used for CUB)
             imgB_thresh = torch.tensor(max(imgsB.size(-2), imgsB.size(-1)), device=device)
