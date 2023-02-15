@@ -541,7 +541,8 @@ def training_loop_tl(
 
             # TODO: make use of w-direction from pca
             G_ema.mapping.w_dir = torch.from_numpy(pca.pca.components_.astype(np.float32)).squeeze(0).cuda()
-
+            G.mapping.w_dir = torch.from_numpy(pca.pca.components_.astype(np.float32)).squeeze(0).cuda()
+    
 
     if rank == 0 and num_gpus > 1:
         torch.distributed.barrier() # others follow
@@ -579,15 +580,15 @@ def training_loop_tl(
     # Setup training phases.
     if rank == 0:
         print('Setting up training phases...')
-    #loss = dnnlib.util.construct_class_by_name(device=device, G=G, D=D, augment_pipe=augment_pipe, **loss_kwargs) # subclass of training.loss.Loss
+
     loss = dnnlib.util.construct_class_by_name(device=device, G=G, T=T, 
                                                     pose_layers=pose_layers, pose_trunc_dist=pose_trunc_dist, fix_w_dist=fix_w_dist, 
                                                     vgg=vgg16, augment_pipe=augment_pipe, **loss_kwargs)
 
-
     phases = []
+    non_module_params = []
     for name, module, opt_kwargs, reg_interval in [('T', T, T_opt_kwargs, None)]: #,[('G', G, G_opt_kwargs, G_reg_interval): ('D', D, D_opt_kwargs, D_reg_interval)]:
-        params = list(module.parameters()) + [G_ema.mapping.w_coeff]
+        params = list(module.parameters()) + non_module_params
 
         if reg_interval is None:
             opt = dnnlib.util.construct_class_by_name(params=params, **opt_kwargs) # subclass of torch.optim.Optimizer
@@ -599,7 +600,6 @@ def training_loop_tl(
             opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
             opt = dnnlib.util.construct_class_by_name(params=params, **opt_kwargs) # subclass of torch.optim.Optimizer
             phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1)]
-            #phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval)]
     for phase in phases:
         phase.start_event = None
         phase.end_event = None
@@ -612,7 +612,7 @@ def training_loop_tl(
     grid_z = None
     grid_c = None
 
-    w_avg = G_ema.mapping.w_avg + G_ema.mapping.w_coeff * G_ema.mapping.w_dir
+    w_avg = G_ema.mapping.w_avg# + G_ema.mapping.w_coeff * G_ema.mapping.w_dir
 
     if rank == 0:
         print('Exporting sample images...')
@@ -694,16 +694,18 @@ def training_loop_tl(
             
             # Accumulate gradients.
             phase.opt.zero_grad(set_to_none=True)
+
             phase.module.requires_grad_(True)
-            
+
             for gen_z, gen_c in zip(phase_gen_z, phase_gen_c):
                 loss.accumulate_gradients(phase=phase.name, real_img=None, real_c=None, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
+
             phase.module.requires_grad_(False)
-            
             
             # Update weights.
             with torch.autograd.profiler.record_function(phase.name + '_opt'):
-                params = [param for param in phase.module.parameters() if param.grad is not None]
+                params = list(phase.module.parameters()) + non_module_params
+                params = [param for param in params if param.grad is not None]
                 if len(params) > 0:
                     flat = torch.cat([param.grad.flatten() for param in params])
                     if num_gpus > 1:
@@ -713,11 +715,11 @@ def training_loop_tl(
                     grads = flat.split([param.numel() for param in params])
                     for param, grad in zip(params, grads):
                         param.grad = grad.reshape(param.shape)
+                
                 phase.opt.step()
 
                 # update w_avg
-                w_avg = G_ema.mapping.w_avg + G_ema.mapping.w_coeff * G_ema.mapping.w_dir
-            
+                w_avg = G_ema.mapping.w_avg + T.w_coeff * G_ema.mapping.w_dir
             
             # Phase done.
             if phase.end_event is not None:
@@ -763,7 +765,10 @@ def training_loop_tl(
         fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
         fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
         torch.cuda.reset_peak_memory_stats()
-        fields += [f"augment {training_stats.report0('Progress/augment', float(augment_pipe.p.cpu()) if augment_pipe is not None else 0):.3f}"]
+        fields += [f"augment {training_stats.report0('Progress/augment', float(augment_pipe.p.cpu()) if augment_pipe is not None else 0):<6.3f}"]
+
+        fields += [f"w_coeff {training_stats.report0('Progress/w_coeff', float(T.w_coeff)):<6.3f}"]
+
         training_stats.report0('Timing/total_hours', (tick_end_time - start_time) / (60 * 60))
         training_stats.report0('Timing/total_days', (tick_end_time - start_time) / (24 * 60 * 60))
         if rank == 0:
@@ -799,10 +804,8 @@ def training_loop_tl(
                 rand_ind = torch.randperm(ws.shape[0])
                 ws_aligned[:, :pose_layers] = ws[rand_ind, :pose_layers].lerp(ws[:, :pose_layers], psi.unsqueeze(1))
 
-                #ws_aligned[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], psi)
-                #ws_align_dir = torch.nn.functional.normalize(torch.randn(ws_aligned[:, :pose_layers].shape, device=device)) * pose_trunc_dist * (1-psi) * 1 * 10
-                #ws_align_dir = torch.sign((ws_align_dir * (ws[:, :pose_layers] - w_avg)).sum(dim=-1, keepdim=True)) * ws_align_dir 
-                #ws_aligned[:, :pose_layers] = ws[:, :pose_layers] + ws_align_dir
+                ws_canon_align = ws.clone()
+                ws_canon_align[:, :pose_layers] = w_avg.lerp(ws[:, :pose_layers], 0)
 
                 images = torch.cat([G_ema.synthesis(ws_[None]) for ws_ in ws])
                 save_image_grid(images.cpu().numpy(), os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)

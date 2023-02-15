@@ -28,10 +28,8 @@ class Loss:
 #----------------------------------------------------------------------------
 
 class TransformerSiameseLoss(Loss):
-    def __init__(self, device, G, T, vgg, augment_pipe=None, use_initial_depth_prob=0, blur_init_sigma=0, blur_fade_kimg=0, psi_anneal=2000, epsilon=1e-4, pose_layers=5, fix_w_dist = False, pose_trunc_dist = 1, ):
+    def __init__(self, device, G, T, vgg, augment_pipe=None, use_initial_depth_prob=0, blur_init_sigma=0, blur_fade_kimg=0, psi_anneal=2000, epsilon=1e-4, pose_layers=5, fix_w_dist = False, pose_trunc_dist = 1):
         super().__init__()
-
-        print("HI")
 
         self.device = device
         self.G = G          # Generator
@@ -48,10 +46,10 @@ class TransformerSiameseLoss(Loss):
         self.pose_trunc_dist    = pose_trunc_dist
         self.fix_w_dist         = fix_w_dist
 
-
     def run_G(self, z, c, psi=None, update_emas=False):
         G = self.G
-        w_avg = G.mapping.w_avg
+
+        w_avg = self.G.mapping.w_avg + self.T.w_coeff * self.G.mapping.w_dir
 
         if self.fix_w_dist:
             ws = G.mapping(z, c, update_emas=update_emas)
@@ -59,17 +57,6 @@ class TransformerSiameseLoss(Loss):
         else:
             ws = G.mapping(z, c, update_emas=update_emas)
             ws[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], self.pose_trunc_dist)
-
-        """
-        ws_aligned = ws.clone()
-        ws_align_dir = torch.nn.functional.normalize(torch.randn(ws_aligned[:, :self.pose_layers].shape, device=self.device)) * self.pose_trunc_dist * (1-psi)  * 10
-        ws_align_dir = torch.sign((ws_align_dir * (ws[:, :self.pose_layers] - w_avg)).sum(dim=-1, keepdim=True)) * ws_align_dir 
-        ws_aligned[:, :self.pose_layers] = ws[:, :self.pose_layers] + ws_align_dir
-        
-
-        ws_aligned = ws.clone()
-        ws_aligned[:, :self.pose_layers] = w_avg.lerp(ws[:, :self.pose_layers], psi)
-        """
 
         ws_posed = ws.clone()
         rand_ind = torch.randperm(ws.shape[0])
@@ -83,7 +70,7 @@ class TransformerSiameseLoss(Loss):
         img_set = G.synthesis(ws_input, update_emas=update_emas)
 
         img, img_posed, img_aligned = img_set.chunk(3)
-        return img, img_posed, img_aligned,  ws, ws_posed, ws_aligned
+        return img, img_posed, img_aligned,  ws, ws_posed, ws_aligned, w_avg
 
 
     def run_T(self, img1, img2, blur_sigma=0, update_emas=False):
@@ -99,10 +86,6 @@ class TransformerSiameseLoss(Loss):
         # set up constants
         blur_sigma = max(1 - cur_nimg / (self.blur_fade_kimg * 1e3), 0) * self.blur_init_sigma if self.blur_fade_kimg > 0 else 0
         
-        # cosine anneal, from gangealing.utils.annealing.cosine_anneal
-        #psi = 0.5 * (1 + torch.cos(torch.tensor(math.pi * min(cur_nimg//1000, self.psi_anneal) / self.psi_anneal))).to(self.device)
-
-        # random psi
         psi = torch.rand((gen_z.shape[0], 1)).to(self.device)
 
         training_stats.report('Loss/psi', psi)
@@ -111,11 +94,11 @@ class TransformerSiameseLoss(Loss):
         with torch.autograd.profiler.record_function('Gmain_forward'):
             # run G to obtain a pair of images
             # img_1 is the "original", and img_2 is a pose-swapped version
-            img_1,  img_2, img_aligned, ws_1, ws_2, ws_aligned = self.run_G(gen_z, gen_c, psi=psi)
+            img_1,  img_2, img_aligned, ws_1, ws_2, ws_aligned, w_avg = self.run_G(gen_z, gen_c, psi=psi)
 
             # siamese transformation
-            transformed_1, transformed_2, mat_1, mat_2, depth_1, depth_2 = self.run_T(img_1.detach(), img_2.detach(), blur_sigma=blur_sigma)
-            transformed_to_aligned, depth_aligned = self.T[1].render_and_warp(img_1.detach(), mat_1, None)
+            transformed_1, transformed_2, mat_1, mat_2, depth_1, depth_2 = self.run_T(img_1, img_2, blur_sigma=blur_sigma)
+            transformed_to_aligned, depth_aligned = self.T[1].render_and_warp(img_1, mat_1, None)
             img = torch.cat([img_1, img_2, img_aligned, 
                             transformed_1, transformed_2, transformed_to_aligned
                             ], dim=0)
@@ -127,10 +110,22 @@ class TransformerSiameseLoss(Loss):
             perceptual_loss = (lpips_t0 - lpips_t1).square().sum(1) / self.epsilon ** 2
             training_stats.report('Loss/perceptual_loss', perceptual_loss)
 
-            flow_identity_loss = depth_aligned.square().sum(3) # / self.epsilon ** 2
+            """
+            # flow should be size (N, H, W, 2)
+            reduce_dims = (0, 1, 2, 3) if reduce_batch else (1, 2, 3)
+            distance_fn = lambda a: torch.where(a <= 1.0, 0.5 * a.pow(2), a - 0.5).mean(dim=reduce_dims)
+            assert depth_aligned.size(-1) == 2
+            diff_y = distance_fn((depth_aligned[:, :-1, :, :] - depth_aligned[:, 1:, :, :]).abs())
+            diff_x = distance_fn((depth_aligned[:, :, :-1, :] - depth_aligned[:, :, 1:, :]).abs())
+            tv_loss = diff_x + diff_y
+
+            training_stats.report('Loss/tv_loss', tv_loss)
+            """
+
+            flow_identity_loss = depth_aligned.square().sum(3)
             training_stats.report('Loss/flow_identity_loss', flow_identity_loss)
 
-            loss = perceptual_loss.mean()# + flow_identity_loss.mean()
+            loss = perceptual_loss.mean() + flow_identity_loss.mean()
 
 
         with torch.autograd.profiler.record_function('Gmain_backward'):

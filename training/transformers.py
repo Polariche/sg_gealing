@@ -946,6 +946,7 @@ class TransformerSequence(nn.Module):
                                             #PerspectiveTransformer(width)])
                                             FlowTransformer(width)])
 
+        self.register_parameter('w_coeff', torch.nn.Parameter(torch.zeros([1])))
         
     
     def forward(self, input_img, source_img=None, padding_mode='border', alpha=None, return_full=False, prev_mat=None, render_mat=None, depth=None, use_initial_depth=False, **kwargs):
