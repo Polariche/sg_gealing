@@ -110,9 +110,8 @@ class TransformerSiameseLoss(Loss):
             perceptual_loss = (lpips_t0 - lpips_t1).square().sum(1) / self.epsilon ** 2
             training_stats.report('Loss/perceptual_loss', perceptual_loss)
 
-            """
             # flow should be size (N, H, W, 2)
-            reduce_dims = (0, 1, 2, 3) if reduce_batch else (1, 2, 3)
+            reduce_dims = (1, 2, 3)
             distance_fn = lambda a: torch.where(a <= 1.0, 0.5 * a.pow(2), a - 0.5).mean(dim=reduce_dims)
             assert depth_aligned.size(-1) == 2
             diff_y = distance_fn((depth_aligned[:, :-1, :, :] - depth_aligned[:, 1:, :, :]).abs())
@@ -120,12 +119,12 @@ class TransformerSiameseLoss(Loss):
             tv_loss = diff_x + diff_y
 
             training_stats.report('Loss/tv_loss', tv_loss)
-            """
 
-            flow_identity_loss = depth_aligned.square().sum(3)
+
+            flow_identity_loss = depth_aligned.square().sum(3) *1e-4
             training_stats.report('Loss/flow_identity_loss', flow_identity_loss)
 
-            loss = perceptual_loss.mean() + flow_identity_loss.mean()
+            loss = perceptual_loss.mean() + flow_identity_loss.mean() + tv_loss.mean()
 
 
         with torch.autograd.profiler.record_function('Gmain_backward'):
